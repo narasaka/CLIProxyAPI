@@ -67,10 +67,21 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time, keep claudeExtraUsageKeep) {
 	claude := strings.EqualFold(strings.TrimSpace(provider), "claude")
 	ordered := arrival > 0 && claude
-	if q == nil || (ordered && arrival < q.observedSeq) {
+	if q == nil {
 		return
 	}
-	if claude && keep != claudeExtraUsageKeepOff && keepClaudeExtraUsageSnapshot(q.Signals, headers, keep == claudeExtraUsageKeepCredential, observedAt) {
+	keeping := claude && keep != claudeExtraUsageKeepOff
+	credentialLevel := keep == claudeExtraUsageKeepCredential
+	if ordered && arrival < q.observedSeq {
+		// Observers can commit out of arrival order. An earlier-arriving response
+		// that shows extra usage still wins over a newer snapshot the keep rule
+		// would have discarded against it: one from the same plan window.
+		if keeping {
+			q.adoptOlderClaudeExtraUsage(headers, credentialLevel, observedAt)
+		}
+		return
+	}
+	if keeping && keepClaudeExtraUsageSnapshot(q.Signals, headers, credentialLevel, observedAt) {
 		return
 	}
 	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && ordered {
@@ -331,5 +342,23 @@ func preserveModelObservations(auth, existing *Auth) {
 		state.Quota.ObservedAt = observation.ObservedAt
 		state.Quota.Signals = observation.Signals
 		state.Quota.observedSeq = observation.observedSeq
+	}
+}
+
+// adoptOlderClaudeExtraUsage takes the signals of headers that arrived before the
+// current snapshot when they show extra usage that the current snapshot only
+// hides, keeping the newer arrival stamp so later responses still order against it.
+func (q *QuotaState) adoptOlderClaudeExtraUsage(headers http.Header, credentialLevel bool, observedAt time.Time) {
+	older := collectQuotaSignals("claude", headers)
+	current := make(http.Header, len(q.Signals))
+	for key, value := range q.Signals {
+		current.Set(key, value)
+	}
+	if !keepClaudeExtraUsageSnapshot(older, current, credentialLevel, observedAt) {
+		return
+	}
+	q.Signals = older
+	if observedAt.After(q.ObservedAt) {
+		q.ObservedAt = observedAt
 	}
 }

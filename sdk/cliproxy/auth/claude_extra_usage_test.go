@@ -1632,3 +1632,51 @@ func TestClaudeExtraUsageLaterWindowFromAnotherModelLiftsSharedBlock(t *testing.
 		t.Fatalf("model X kept a shared block after the window rolled over: %v", errRefuse)
 	}
 }
+
+func TestClaudeExtraUsageBlockSurvivesOutOfOrderObserverCommits(t *testing.T) {
+	now := time.Now()
+	reset := strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10)
+	for _, tc := range []struct {
+		name     string
+		crossing map[string]string
+		stale    map[string]string
+		checked  string
+	}{
+		{
+			name:     "shared window",
+			crossing: claudeExtraUsageSignals(now, nil),
+			stale: map[string]string{
+				"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-5h-Status": "allowed_warning",
+				"Anthropic-Ratelimit-Unified-5h-Reset": reset,
+			},
+			checked: "claude-extra-usage-order-other",
+		},
+		{
+			name: "model window",
+			crossing: claudeExtraUsageSignals(now, map[string]string{
+				"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+				"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+			}),
+			stale: map[string]string{
+				"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+				"Anthropic-Ratelimit-Unified-Reset": reset,
+			},
+			checked: "claude-extra-usage-order-opus",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const opus = "claude-extra-usage-order-opus"
+			manager, _, _ := newClaudeExtraUsageTestManager(t, opus, "block", nil)
+			// The crossing headers arrive first, then a stale same-window response...
+			crossing := claudeHeadersContext(t, tc.crossing)
+			stale := claudeHeadersContext(t, tc.stale)
+			// ...but the stale one is committed first.
+			manager.MarkResult(stale, Result{AuthID: "cred-a", Provider: "claude", Model: opus, RouteModel: opus, Success: true})
+			manager.MarkResult(crossing, Result{AuthID: "cred-a", Provider: "claude", Model: opus, RouteModel: opus, Success: true})
+			auth, _ := manager.GetByID("cred-a")
+			if manager.claudeExtraUsageRefusal(auth, tc.checked, tc.checked, time.Now()) == nil {
+				t.Fatal("the crossing response was lost because its observer committed after a stale one")
+			}
+		})
+	}
+}
