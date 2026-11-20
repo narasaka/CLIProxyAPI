@@ -164,9 +164,11 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel, routeModel s
 // by header arrival when both carry one, since recording order can differ from
 // arrival order, and by observation time otherwise.
 func observationIsNewer(candidate, current QuotaState) bool {
-	if candidate.observedSeq > 0 && current.observedSeq > 0 {
+	if candidate.observedSeq > 0 && current.observedSeq > 0 && candidate.observedSeq != current.observedSeq {
 		return candidate.observedSeq > current.observedSeq
 	}
+	// Equal stamps differ only when an older extra-usage response was adopted
+	// under the newer stamp; the adoption is the later observation.
 	return candidate.ObservedAt.After(current.ObservedAt)
 }
 

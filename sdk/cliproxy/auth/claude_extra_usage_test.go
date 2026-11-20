@@ -1680,3 +1680,62 @@ func TestClaudeExtraUsageBlockSurvivesOutOfOrderObserverCommits(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeExtraUsageAdoptedBlockBeatsAnAlreadyPickedCopy(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			model := "claude-extra-usage-adopt-picked-" + mode
+			now := time.Now()
+			manager, executor, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+			crossing := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil))
+			stale := claudeHeadersContext(t, map[string]string{
+				"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-5h-Status": "allowed_warning",
+				"Anthropic-Ratelimit-Unified-5h-Reset": strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+			})
+			// The stale response commits first; the next request picks that snapshot.
+			manager.MarkResult(stale, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+			opts := cliproxyexecutor.Options{
+				RequestAfterAuthInterceptor: func(_ context.Context, req cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
+					if authID, _ := req.Metadata[cliproxyexecutor.SelectedAuthMetadataKey].(string); authID == "cred-a" {
+						// The crossing response, which arrived earlier, commits now.
+						manager.MarkResult(crossing, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+					}
+					return cliproxyexecutor.RequestAfterAuthInterceptResponse{}
+				},
+			}
+			payload, errInvoke := invokeAfterAuthMode(manager, "claude", model, mode, opts)
+			if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
+				t.Fatalf("executor calls = %v (payload %q, error %v), want the adopted block to move the request to cred-b", calls, payload, errInvoke)
+			}
+		})
+	}
+}
+
+func TestClaudeExtraUsageAdoptedBlockSurvivesARefreshStartedEarlier(t *testing.T) {
+	const model = "claude-extra-usage-adopt-refresh"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	crossing := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil))
+	stale := claudeHeadersContext(t, map[string]string{
+		"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-5h-Status": "allowed_warning",
+		"Anthropic-Ratelimit-Unified-5h-Reset": strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+	})
+	manager.MarkResult(stale, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	// A token refresh starts from the stale snapshot...
+	base, _ := manager.GetByID("cred-a")
+	// ...then the earlier-arriving crossing response commits and is adopted...
+	manager.MarkResult(crossing, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	// ...and the refresh commits its copy afterwards.
+	refreshed := base.Clone()
+	if refreshed.Metadata == nil {
+		refreshed.Metadata = map[string]any{}
+	}
+	refreshed.Metadata["access_token"] = "refreshed-token"
+	if _, errUpd := manager.UpdateRefreshedAuth(WithSkipPersist(t.Context()), base, refreshed); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	auth, _ := manager.GetByID("cred-a")
+	if manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) == nil {
+		t.Fatalf("a refresh started before the adoption erased the block; signals = %v", auth.Quota.Signals)
+	}
+}

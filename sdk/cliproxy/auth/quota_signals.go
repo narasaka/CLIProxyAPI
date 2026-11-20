@@ -285,7 +285,7 @@ func mergeQuotaObservation(target, source QuotaState) QuotaState {
 	}
 	// Header arrival orders Claude snapshots when both carry it; recording time
 	// can lag behind it.
-	if source.observedSeq > 0 && target.observedSeq > 0 {
+	if source.observedSeq > 0 && target.observedSeq > 0 && source.observedSeq != target.observedSeq {
 		if source.observedSeq < target.observedSeq {
 			return target
 		}
@@ -358,7 +358,10 @@ func (q *QuotaState) adoptOlderClaudeExtraUsage(headers http.Header, credentialL
 		return
 	}
 	q.Signals = older
-	if observedAt.After(q.ObservedAt) {
-		q.ObservedAt = observedAt
+	// The adoption keeps the newer arrival stamp, so it must be the later
+	// observation for copies that hold that stamp to defer to it.
+	if !observedAt.After(q.ObservedAt) {
+		observedAt = q.ObservedAt.Add(time.Nanosecond)
 	}
+	q.ObservedAt = observedAt
 }
