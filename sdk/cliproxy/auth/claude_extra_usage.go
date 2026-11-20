@@ -47,6 +47,21 @@ func ApplyClaudeExtraUsageMetadata(auth *Auth) {
 	auth.Attributes[AttributeClaudeExtraUsage] = value
 }
 
+// claudeSubscriptionCredential reports whether auth bills against a Claude plan,
+// the only kind of credential extra usage applies to. It matches the Claude
+// executor's classification: an OAuth token is a subscription credential even
+// when configured as an API key, and a real API key is always billed at API rates.
+func claudeSubscriptionCredential(auth *Auth) bool {
+	apiKey := strings.TrimSpace(authAttribute(auth, AttributeAPIKey))
+	if strings.Contains(apiKey, "sk-ant-oat") {
+		return true
+	}
+	if auth.AuthKind() == AuthKindAPIKey {
+		return false
+	}
+	return apiKey == ""
+}
+
 // claudeExtraUsageBlocked reports whether the effective policy for auth is block:
 // the credential's own value wins over the global claude.extra-usage setting.
 func claudeExtraUsageBlocked(cfg *internalconfig.Config, auth *Auth) bool {
@@ -67,9 +82,7 @@ func claudeExtraUsageBlocked(cfg *internalconfig.Config, auth *Auth) bool {
 // on the next request. Once no other credential can serve the request, the client
 // receives a 429 that carries the plan's reset time.
 func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now time.Time) error {
-	// Extra usage belongs to subscription credentials; an API key is always
-	// billed at API rates, so the policy never applies to it.
-	if auth == nil || executorKeyFromAuth(auth) != "claude" || isAPIKeyAuth(auth) || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
+	if auth == nil || executorKeyFromAuth(auth) != "claude" || !claudeSubscriptionCredential(auth) || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
 		return nil
 	}
 	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel)

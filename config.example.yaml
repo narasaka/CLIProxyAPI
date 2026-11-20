@@ -566,7 +566,8 @@ upstream:
     # already sent when its response arrives, are still billed. Switching back to
     # allow takes effect on the next request. Hot-reloadable.
     # Override per credential with "extra_usage": "allow" or "block" in its auth file.
-    # API-key credentials are billed at API rates anyway and are never affected.
+    # Real API keys are billed at API rates anyway and are never affected; an OAuth
+    # token (sk-ant-oat...) configured under claude-api-key counts as a subscription.
     extra-usage: allow
 
     # Days to retain the cloaked currentDate pin per session in in-memory mode

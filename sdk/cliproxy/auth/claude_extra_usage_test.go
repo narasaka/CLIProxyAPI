@@ -1268,8 +1268,12 @@ func TestClaudeExtraUsageNeverRefusesAPIKeyCredentials(t *testing.T) {
 	if errRefuse := manager.claudeExtraUsageRefusal(apiKey, "claude-model", time.Now()); errRefuse != nil {
 		t.Fatalf("API-key credential refused: %v", errRefuse)
 	}
-	oauth := &Auth{ID: "seat", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Quota: QuotaState{Signals: signals}}
-	if errRefuse := manager.claudeExtraUsageRefusal(oauth, "claude-model", time.Now()); errRefuse == nil {
-		t.Fatal("OAuth subscription credential not refused")
+	for name, seat := range map[string]*Auth{
+		"oauth file":                {ID: "seat", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Quota: QuotaState{Signals: signals}},
+		"oauth token as an api key": {ID: "seat-key", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindAPIKey, AttributeAPIKey: "sk-ant-oat01-seat"}, Quota: QuotaState{Signals: signals}},
+	} {
+		if errRefuse := manager.claudeExtraUsageRefusal(seat, "claude-model", time.Now()); errRefuse == nil {
+			t.Fatalf("%s: subscription credential not refused", name)
+		}
 	}
 }
