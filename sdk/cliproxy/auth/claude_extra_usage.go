@@ -81,11 +81,11 @@ func claudeExtraUsageBlocked(cfg *internalconfig.Config, auth *Auth) bool {
 // recorded on the credential, so switching the policy back to allow takes effect
 // on the next request. Once no other credential can serve the request, the client
 // receives a 429 that carries the plan's reset time.
-func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now time.Time) error {
+func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel, routeModel string, now time.Time) error {
 	if auth == nil || executorKeyFromAuth(auth) != "claude" || !claudeSubscriptionCredential(auth) || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
 		return nil
 	}
-	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel)
+	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel, routeModel)
 	signals := credentialSignals
 	resetAt, blocked := claudeExtraUsageResetAt(credentialSignals, true, now)
 	// The requested model may also be blocked by its own weekly window, which can
@@ -109,7 +109,8 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 // rate-limit snapshots for auth. The picked auth can be a per-model scheduler copy
 // that missed responses for other models on the same credential, so the manager's
 // live auth is consulted too; a Home-dispatched auth may exist only as the copy.
-func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (credential, model map[string]string) {
+// The live model state is found under the key MarkResult records it under.
+func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel, routeModel string) (credential, model map[string]string) {
 	credentialQuota := auth.Quota
 	var modelQuota QuotaState
 	if state := existingModelState(auth, stateModel); state != nil {
@@ -120,7 +121,7 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (cred
 		if observationIsNewer(live.Quota, credentialQuota) {
 			credentialQuota = live.Quota
 		}
-		if state := existingModelState(live, stateModel); state != nil && observationIsNewer(state.Quota, modelQuota) {
+		if state := existingModelState(live, m.claudeObservationModelKeyLocked(live, stateModel, routeModel)); state != nil && observationIsNewer(state.Quota, modelQuota) {
 			modelQuota = state.Quota
 		}
 	}
@@ -145,7 +146,7 @@ func observationIsNewer(candidate, current QuotaState) bool {
 // would not block new requests for as long as it runs. Arrival ordering keeps the
 // later result from replacing anything newer, and the same staleness check as
 // MarkResult keeps an attempt on a replaced credential off its successor.
-func (m *Manager) watchClaudeResponseHeaders(ctx context.Context, attempt *Auth, accessToken, provider, model string) {
+func (m *Manager) watchClaudeResponseHeaders(ctx context.Context, attempt *Auth, accessToken, provider, model, routeModel string) {
 	if m == nil || attempt == nil || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
 		return
 	}
@@ -156,11 +157,11 @@ func (m *Manager) watchClaudeResponseHeaders(ctx context.Context, attempt *Auth,
 		RegistrationEpoch: attempt.RegistrationEpoch,
 	}
 	internallogging.ObserveResponseHeaders(ctx, func(headers http.Header, arrival uint64) {
-		m.observeClaudeResponseHeaders(identity, provider, model, headers, arrival)
+		m.observeClaudeResponseHeaders(identity, provider, model, routeModel, headers, arrival)
 	})
 }
 
-func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model string, headers http.Header, arrival uint64) {
+func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model, routeModel string, headers http.Header, arrival uint64) {
 	if len(headers) == 0 {
 		return
 	}
@@ -172,9 +173,24 @@ func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model 
 		return
 	}
 	auth.Quota.observeResultHeaders(provider, headers, arrival, now)
-	if state := ensureModelState(auth, model); state != nil {
+	if state := ensureModelState(auth, m.claudeObservationModelKeyLocked(auth, model, routeModel)); state != nil {
 		state.Quota.observeResultHeaders(provider, headers, arrival, now)
 	}
+}
+
+// claudeObservationModelKeyLocked returns the model-state key MarkResult records
+// a result for model under, so early observations and refusal lookups use the
+// same per-model snapshot as recorded results (aliases and prefixes included).
+// The caller holds m.mu.
+func (m *Manager) claudeObservationModelKeyLocked(auth *Auth, model, routeModel string) string {
+	modelKey := canonicalModelKey(model)
+	if modelKey == "" {
+		modelKey = canonicalModelKey(routeModel)
+	}
+	if modelKey == "" {
+		return ""
+	}
+	return m.resolveMarkResultModelKeyLocked(auth, modelKey, routeModel)
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's

@@ -671,6 +671,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	if !credChanged {
+		preserveModelObservations(auth, existing)
+	}
 	auth.UpdatedAt = now
 	cooldownStateChanged = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false) || cooldownStateChanged
 	seedInitialForceCooldownDeadlines(auth)

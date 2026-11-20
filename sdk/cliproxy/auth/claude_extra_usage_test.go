@@ -289,10 +289,10 @@ func TestClaudeExtraUsageModelSnapshotBlocksOnlyThatModel(t *testing.T) {
 		Quota:       QuotaState{Signals: opusSignals},
 		ModelStates: map[string]*ModelState{"claude-opus-test": {Quota: QuotaState{Signals: opusSignals}}},
 	}
-	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-opus-test", now); !isCredentialTerminatedError(errRefuse) {
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-opus-test", "claude-opus-test", now); !isCredentialTerminatedError(errRefuse) {
 		t.Fatalf("opus refusal = %v, want credential refusal", errRefuse)
 	}
-	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-sonnet-test", now); errRefuse != nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-sonnet-test", "claude-sonnet-test", now); errRefuse != nil {
 		t.Fatalf("sonnet refusal = %v, want none", errRefuse)
 	}
 
@@ -308,10 +308,10 @@ func TestClaudeExtraUsageModelSnapshotBlocksOnlyThatModel(t *testing.T) {
 		"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
 	})
 	var refusal *credentialTerminatedError
-	if !errors.As(manager.claudeExtraUsageRefusal(auth, "claude-opus-test", now), &refusal) || (refusal.recoverAt.Sub(now)-6*24*time.Hour).Abs() > time.Second {
+	if !errors.As(manager.claudeExtraUsageRefusal(auth, "claude-opus-test", "claude-opus-test", now), &refusal) || (refusal.recoverAt.Sub(now)-6*24*time.Hour).Abs() > time.Second {
 		t.Fatalf("opus refusal = %+v, want recovery in 6 days", refusal)
 	}
-	if !errors.As(manager.claudeExtraUsageRefusal(auth, "claude-sonnet-test", now), &refusal) || (refusal.recoverAt.Sub(now)-time.Hour).Abs() > time.Second {
+	if !errors.As(manager.claudeExtraUsageRefusal(auth, "claude-sonnet-test", "claude-sonnet-test", now), &refusal) || (refusal.recoverAt.Sub(now)-time.Hour).Abs() > time.Second {
 		t.Fatalf("sonnet refusal = %+v, want recovery in 1 hour", refusal)
 	}
 }
@@ -614,7 +614,7 @@ func TestClaudeExtraUsageSnapshotsFollowHeaderArrival(t *testing.T) {
 	}
 	refused := func(manager *Manager) bool {
 		auth, _ := manager.GetByID("cred-a")
-		return manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil
+		return manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) != nil
 	}
 
 	t.Run("stream that started before the crossing ends late", func(t *testing.T) {
@@ -679,7 +679,7 @@ func TestClaudeExtraUsageCredentialFailureKeepsSnapshotOrder(t *testing.T) {
 	manager.MarkResult(staleCtx, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true, ExecutionSeq: 1})
 
 	auth, _ := manager.GetByID("cred-a")
-	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-extra-usage-other-model", time.Now()); errRefuse == nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-extra-usage-other-model", "claude-extra-usage-other-model", time.Now()); errRefuse == nil {
 		t.Fatalf("shared block lifted by a stale completion after a credential-level failure; signals = %v", auth.Quota.Signals)
 	}
 }
@@ -889,7 +889,7 @@ func TestClaudeExtraUsageStreamFromReplacedCredentialIsIgnored(t *testing.T) {
 		t.Fatalf("replacement epoch %d not newer than %d", replacement.RegistrationEpoch, attempt.RegistrationEpoch)
 	}
 	ctx := internallogging.WithFreshResponseHeadersHolder(WithSkipPersist(t.Context()))
-	manager.watchClaudeResponseHeaders(ctx, attempt, "", "claude", model)
+	manager.watchClaudeResponseHeaders(ctx, attempt, "", "claude", model, model)
 	headers := http.Header{}
 	for key, value := range claudeExtraUsageSignals(time.Now(), nil) {
 		headers.Set(key, value)
@@ -897,7 +897,7 @@ func TestClaudeExtraUsageStreamFromReplacedCredentialIsIgnored(t *testing.T) {
 	internallogging.SetResponseHeaders(ctx, headers)
 
 	current, _ := manager.GetByID("cred-a")
-	if errRefuse := manager.claudeExtraUsageRefusal(current, model, time.Now()); errRefuse != nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(current, model, model, time.Now()); errRefuse != nil {
 		t.Fatalf("old credential's stream blocked its replacement: %v", errRefuse)
 	}
 }
@@ -945,7 +945,7 @@ func TestClaudeExtraUsageBlockAppliesBeforeTheFirstStreamPayload(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 	for {
 		auth, _ := manager.GetByID("cred-a")
-		if auth != nil && len(executor.Calls()) == 1 && manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil {
+		if auth != nil && len(executor.Calls()) == 1 && manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) != nil {
 			break
 		}
 		select {
@@ -1127,7 +1127,7 @@ func TestClaudeExtraUsageBlockAppliesWhileANonStreamingResponseIsBuffered(t *tes
 	deadline := time.After(5 * time.Second)
 	for {
 		auth, _ := manager.GetByID("cred-a")
-		if auth != nil && manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil {
+		if auth != nil && manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) != nil {
 			break
 		}
 		select {
@@ -1158,7 +1158,7 @@ func TestClaudeExtraUsageIncompleteVerificationRecordsBlock(t *testing.T) {
 		t.Fatal("VerifyInference() succeeded, want an incomplete-response error")
 	}
 	auth, _ := manager.GetByID("cred-a")
-	if errRefuse := manager.claudeExtraUsageRefusal(auth, model, time.Now()); errRefuse == nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, model, model, time.Now()); errRefuse == nil {
 		t.Fatalf("incomplete verification lost its extra-usage headers; signals = %v", auth.Quota.Signals)
 	}
 }
@@ -1169,7 +1169,7 @@ func TestClaudeExtraUsageSnapshotChoiceFollowsHeaderArrival(t *testing.T) {
 	live, _ := manager.GetByID("cred-a")
 	// The crossing headers arrived last (stamp 20) but were recorded first.
 	manager.observeClaudeResponseHeaders(Result{AuthID: "cred-a", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
-		"claude", model, http.Header{
+		"claude", model, model, http.Header{
 			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
 			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
 			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
@@ -1184,7 +1184,7 @@ func TestClaudeExtraUsageSnapshotChoiceFollowsHeaderArrival(t *testing.T) {
 	picked := live.Clone()
 	picked.Quota = stale
 	picked.ModelStates = map[string]*ModelState{model: {Status: StatusActive, Quota: stale}}
-	if errRefuse := manager.claudeExtraUsageRefusal(picked, model, time.Now()); errRefuse == nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(picked, model, model, time.Now()); errRefuse == nil {
 		t.Fatal("an older response recorded later hid the newer extra-usage snapshot")
 	}
 }
@@ -1200,7 +1200,7 @@ func TestClaudeExtraUsageBlockRecordedDuringAfterAuthInterceptorIsHonored(t *tes
 						// Another response on cred-a crosses the limit while the plugin runs.
 						live, _ := manager.GetByID("cred-a")
 						manager.observeClaudeResponseHeaders(Result{AuthID: "cred-a", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
-							"claude", model, http.Header{
+							"claude", model, model, http.Header{
 								"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
 								"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
 								"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
@@ -1234,7 +1234,7 @@ func TestClaudeExtraUsageModelBlockSurvivesCooldownUnwrap(t *testing.T) {
 	// A request already sent crosses the model's weekly limit; its headers arrive now.
 	attempt, _ := manager.GetByID("cred-a")
 	crossing := internallogging.WithFreshResponseHeadersHolder(WithSkipPersist(t.Context()))
-	manager.watchClaudeResponseHeaders(crossing, attempt, "", "claude", model)
+	manager.watchClaudeResponseHeaders(crossing, attempt, "", "claude", model, model)
 	headers := http.Header{}
 	for key, value := range claudeExtraUsageSignals(time.Now(), map[string]string{
 		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
@@ -1244,7 +1244,7 @@ func TestClaudeExtraUsageModelBlockSurvivesCooldownUnwrap(t *testing.T) {
 	}
 	internallogging.SetResponseHeaders(crossing, headers)
 	before, _ := manager.GetByID("cred-a")
-	if before.ModelStates[model].credentialQuotaShadow == nil || manager.claudeExtraUsageRefusal(before, model, time.Now()) == nil {
+	if before.ModelStates[model].credentialQuotaShadow == nil || manager.claudeExtraUsageRefusal(before, model, model, time.Now()) == nil {
 		t.Fatal("setup: want a wrapped model state that is blocked")
 	}
 
@@ -1255,7 +1255,7 @@ func TestClaudeExtraUsageModelBlockSurvivesCooldownUnwrap(t *testing.T) {
 	manager.MarkResult(delayed, Result{AuthID: "cred-a", Provider: "claude", Model: model,
 		Error: &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "capacity"}, RetryAfter: &minute})
 	after, _ := manager.GetByID("cred-a")
-	if manager.claudeExtraUsageRefusal(after, model, time.Now()) == nil {
+	if manager.claudeExtraUsageRefusal(after, model, model, time.Now()) == nil {
 		t.Fatalf("the cooldown unwrap rolled back the newer model block; model signals = %v", after.ModelStates[model].Quota.Signals)
 	}
 }
@@ -1265,14 +1265,14 @@ func TestClaudeExtraUsageNeverRefusesAPIKeyCredentials(t *testing.T) {
 	manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
 	signals := claudeExtraUsageSignals(time.Now(), nil)
 	apiKey := &Auth{ID: "key", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindAPIKey}, Quota: QuotaState{Signals: signals}}
-	if errRefuse := manager.claudeExtraUsageRefusal(apiKey, "claude-model", time.Now()); errRefuse != nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(apiKey, "claude-model", "claude-model", time.Now()); errRefuse != nil {
 		t.Fatalf("API-key credential refused: %v", errRefuse)
 	}
 	for name, seat := range map[string]*Auth{
 		"oauth file":                {ID: "seat", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Quota: QuotaState{Signals: signals}},
 		"oauth token as an api key": {ID: "seat-key", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindAPIKey, AttributeAPIKey: "sk-ant-oat01-seat"}, Quota: QuotaState{Signals: signals}},
 	} {
-		if errRefuse := manager.claudeExtraUsageRefusal(seat, "claude-model", time.Now()); errRefuse == nil {
+		if errRefuse := manager.claudeExtraUsageRefusal(seat, "claude-model", "claude-model", time.Now()); errRefuse == nil {
 			t.Fatalf("%s: subscription credential not refused", name)
 		}
 	}
@@ -1288,7 +1288,7 @@ type claudeVerifyFallbackExecutor struct {
 
 func (e *claudeVerifyFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	e.manager.observeClaudeResponseHeaders(Result{AuthID: auth.ID, RegistrationEpoch: auth.RegistrationEpoch, CredentialVersion: auth.CredentialVersion},
-		"claude", e.model, http.Header{
+		"claude", e.model, e.model, http.Header{
 			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
 			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
 			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
@@ -1329,7 +1329,7 @@ func TestClaudeExtraUsageBlockSurvivesConfigCredentialReload(t *testing.T) {
 	}
 	live, _ := manager.GetByID("seat")
 	manager.observeClaudeResponseHeaders(Result{AuthID: "seat", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
-		"claude", "claude-extra-usage-reload-other", http.Header{
+		"claude", "claude-extra-usage-reload-other", "claude-extra-usage-reload-other", http.Header{
 			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
 			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
 			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
@@ -1341,7 +1341,7 @@ func TestClaudeExtraUsageBlockSurvivesConfigCredentialReload(t *testing.T) {
 		t.Fatal(errUpd)
 	}
 	reloaded, _ := manager.GetByID("seat")
-	if errRefuse := manager.claudeExtraUsageRefusal(reloaded, model, time.Now()); errRefuse == nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(reloaded, model, model, time.Now()); errRefuse == nil {
 		t.Fatalf("config reload erased the shared block; signals = %v", reloaded.Quota.Signals)
 	}
 	// New credentials under the same ID do not inherit the credential-level snapshot.
@@ -1351,7 +1351,117 @@ func TestClaudeExtraUsageBlockSurvivesConfigCredentialReload(t *testing.T) {
 		t.Fatal(errUpd)
 	}
 	other, _ := manager.GetByID("seat")
-	if errRefuse := manager.claudeExtraUsageRefusal(other, model, time.Now()); errRefuse != nil {
+	if errRefuse := manager.claudeExtraUsageRefusal(other, model, model, time.Now()); errRefuse != nil {
 		t.Fatalf("a different credential inherited the old block: %v", errRefuse)
+	}
+}
+
+func TestClaudeExtraUsageModelBlockSurvivesCredentialUpdates(t *testing.T) {
+	const opus = "claude-extra-usage-update-opus"
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+	seat := func() *Auth {
+		return &Auth{ID: "seat", Provider: "claude", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}}
+	}
+	registry.GetGlobalRegistry().RegisterClient("seat", "claude", []*registry.ModelInfo{{ID: opus}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("seat") })
+	if _, errReg := manager.Register(WithSkipPersist(t.Context()), seat()); errReg != nil {
+		t.Fatal(errReg)
+	}
+	live, _ := manager.GetByID("seat")
+	manager.observeClaudeResponseHeaders(Result{AuthID: "seat", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
+		"claude", opus, opus, http.Header{
+			"Anthropic-Ratelimit-Unified-Status":               {"rejected"},
+			"Anthropic-Ratelimit-Unified-Representative-Claim": {"seven_day_opus"},
+			"Anthropic-Ratelimit-Unified-Overage-Status":       {"allowed"},
+			"Anthropic-Ratelimit-Unified-Reset":                {strconv.FormatInt(time.Now().Add(48*time.Hour).Unix(), 10)},
+		}, 1<<62)
+	refused := func(step string) {
+		t.Helper()
+		current, _ := manager.GetByID("seat")
+		if manager.claudeExtraUsageRefusal(current, opus, opus, time.Now()) == nil {
+			t.Fatalf("%s erased the per-model block", step)
+		}
+	}
+	refused("setup")
+
+	// An update that brings its own, older model states.
+	stale := seat()
+	stale.ModelStates = map[string]*ModelState{opus: {Status: StatusActive, Quota: QuotaState{
+		Signals: map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"}, ObservedAt: time.Now().Add(-time.Hour),
+	}}}
+	if _, errUpd := manager.Update(WithSkipPersist(t.Context()), stale); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	refused("an update with older model states")
+
+	// Disabling and re-enabling through rebuilt records.
+	disabled := seat()
+	disabled.Disabled, disabled.Status = true, StatusDisabled
+	if _, errUpd := manager.Update(WithSkipPersist(t.Context()), disabled); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	if _, errUpd := manager.Update(WithSkipPersist(t.Context()), seat()); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	refused("a disable and re-enable")
+}
+
+// claudeWeeklyOpusExecutor reports a per-model weekly window in extra usage.
+type claudeWeeklyOpusExecutor struct {
+	*afterAuthTestExecutor
+}
+
+func (e *claudeWeeklyOpusExecutor) setHeaders(ctx context.Context) {
+	headers := http.Header{}
+	for key, value := range claudeExtraUsageSignals(time.Now(), map[string]string{
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+		"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+	}) {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
+}
+
+func (e *claudeWeeklyOpusExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.setHeaders(ctx)
+	return e.afterAuthTestExecutor.Execute(ctx, auth, req, opts)
+}
+
+func (e *claudeWeeklyOpusExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.setHeaders(ctx)
+	return e.afterAuthTestExecutor.ExecuteStream(ctx, auth, req, opts)
+}
+
+func TestClaudeExtraUsagePerModelBlockAppliesToPrefixedAliases(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			const route = "tenant/opus"
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{
+				Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"},
+				ClaudeKey: []internalconfig.ClaudeKey{{APIKey: "sk-ant-oat01-alias-seat", Prefix: "tenant",
+					Models: []internalconfig.ClaudeModel{{Name: "claude-opus-4-6", Alias: "opus"}}}},
+			})
+			executor := &claudeWeeklyOpusExecutor{&afterAuthTestExecutor{id: "claude"}}
+			manager.RegisterExecutor(executor)
+			registry.GetGlobalRegistry().RegisterClient("alias-seat", "claude", []*registry.ModelInfo{{ID: route}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("alias-seat") })
+			seat := &Auth{ID: "alias-seat", Provider: "claude", Prefix: "tenant", Status: StatusActive,
+				Attributes: map[string]string{AttributeAuthKind: AuthKindAPIKey, AttributeAPIKey: "sk-ant-oat01-alias-seat"}}
+			if _, errReg := manager.Register(WithSkipPersist(t.Context()), seat); errReg != nil {
+				t.Fatal(errReg)
+			}
+
+			if _, errInvoke := invokeAfterAuthMode(manager, "claude", route, mode, cliproxyexecutor.Options{}); errInvoke != nil {
+				t.Fatalf("crossing request error = %v", errInvoke)
+			}
+			calls := len(executor.Calls())
+			_, errInvoke := invokeAfterAuthMode(manager, "claude", route, mode, cliproxyexecutor.Options{})
+			var cooldown *modelCooldownError
+			if !errors.As(errInvoke, &cooldown) || len(executor.Calls()) != calls {
+				t.Fatalf("per-model block missed for %s: upstream calls %d -> %d, error = %v", route, calls, len(executor.Calls()), errInvoke)
+			}
+		})
 	}
 }

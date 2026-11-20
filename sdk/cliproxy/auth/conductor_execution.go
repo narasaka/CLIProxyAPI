@@ -842,9 +842,9 @@ func (e *credentialTerminatedError) Error() string {
 // extra-usage check runs again after the interceptor, which may wait while
 // another response records a block. Token counting is not billed, so it skips
 // the extra-usage check.
-func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel string, countTokens bool, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel, routeModel string, countTokens bool, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
 	if !countTokens {
-		if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+		if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
 			return req, opts, errRefuse
 		}
 	}
@@ -852,7 +852,7 @@ func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderEx
 	if errIntercept != nil || countTokens || opts.RequestAfterAuthInterceptor == nil {
 		return req, opts, errIntercept
 	}
-	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
 		return req, opts, errRefuse
 	}
 	return req, opts, nil
@@ -1314,7 +1314,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
-			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, routeModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
 				if isCredentialTerminatedError(errIntercept) {
 					recordRequestRefusedAuth(ctx, auth.ID)
@@ -1328,7 +1328,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			upstreamBeforeAttempt := upstreamErr
-			m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel)
+			m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel, routeModel)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -1349,7 +1349,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 					// The refreshed token resolves the 401, but resending is a new billed
 					// request, so it honors a block recorded in the meantime.
-					if errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, time.Now()); errRefuse != nil {
+					if errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, routeModel, time.Now()); errRefuse != nil {
 						upstreamErr = upstreamBeforeAttempt
 						recordRequestRefusedAuth(ctx, auth.ID)
 						authErr = errRefuse
@@ -1357,7 +1357,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
-					m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel)
+					m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel, routeModel)
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
@@ -3424,7 +3424,7 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 		stateModel = canonicalModelKey(routeModel)
 	}
 	// Verification is a real, billed request, so it honors claude.extra-usage too.
-	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
 		return auth, unwrapExecutionBoundaryError(errRefuse)
 	}
 
@@ -3452,13 +3452,13 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	credVersion := auth.CredentialVersion
 	regEpoch := auth.RegistrationEpoch
 
-	m.watchClaudeResponseHeaders(execCtx, auth, accessToken, provider, stateModel)
+	m.watchClaudeResponseHeaders(execCtx, auth, accessToken, provider, stateModel, routeModel)
 	streamRes, errStream := executor.ExecuteStream(execCtx, auth, req, opts)
 	if errStream != nil {
 		rerr := resultErrorFromError(errStream)
 		if rerr != nil && rerr.HTTPStatus == http.StatusNotImplemented {
 			// The fallback is another billed request; honor a block recorded meanwhile.
-			if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+			if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
 				return auth, unwrapExecutionBoundaryError(errRefuse)
 			}
 			opts.Stream = false

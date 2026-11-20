@@ -291,3 +291,38 @@ func replaceModelStateKeepingObservation(state *ModelState, replacement ModelSta
 	*state = replacement
 	state.Quota = mergeQuotaObservation(state.Quota, observation)
 }
+
+// preserveModelObservations keeps each model's newer passive quota observation
+// when a credential is updated with the same credentials, whatever model states
+// the update brings. Only observation data moves; cooldown state is untouched.
+func preserveModelObservations(auth, existing *Auth) {
+	if auth == nil || existing == nil {
+		return
+	}
+	cloned := false
+	for model, previous := range existing.ModelStates {
+		if previous == nil || previous.Quota.ObservedAt.IsZero() {
+			continue
+		}
+		state := auth.ModelStates[model]
+		if state == previous {
+			continue
+		}
+		if !cloned {
+			auth.ModelStates = cloneModelStates(auth.ModelStates)
+			if auth.ModelStates == nil {
+				auth.ModelStates = make(map[string]*ModelState)
+			}
+			cloned = true
+			state = auth.ModelStates[model]
+		}
+		if state == nil {
+			state = &ModelState{Status: StatusActive}
+			auth.ModelStates[model] = state
+		}
+		observation := mergeQuotaObservation(state.Quota, previous.Quota)
+		state.Quota.ObservedAt = observation.ObservedAt
+		state.Quota.Signals = observation.Signals
+		state.Quota.observedSeq = observation.observedSeq
+	}
+}
