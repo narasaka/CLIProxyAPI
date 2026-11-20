@@ -167,7 +167,7 @@ func observationIsNewer(candidate, current QuotaState) bool {
 	if candidate.observedSeq > 0 && current.observedSeq > 0 && candidate.observedSeq != current.observedSeq {
 		return candidate.observedSeq > current.observedSeq
 	}
-	// Equal stamps differ only when an older extra-usage response was adopted
+	// Equal stamps can differ when an older extra-usage response was adopted
 	// under the newer stamp; the adoption is the later observation.
 	return candidate.ObservedAt.After(current.ObservedAt)
 }
