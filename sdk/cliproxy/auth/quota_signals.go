@@ -262,11 +262,32 @@ func isQuotaSignalHeaderForProvider(provider, name string) bool {
 // unioning signals captured at different times, so merging an older snapshot
 // can never resurrect a stale watermark.
 func mergeQuotaObservation(target, source QuotaState) QuotaState {
-	if source.ObservedAt.IsZero() || source.ObservedAt.Before(target.ObservedAt) {
+	if source.ObservedAt.IsZero() {
+		return target
+	}
+	// Header arrival orders Claude snapshots when both carry it; recording time
+	// can lag behind it.
+	if source.observedSeq > 0 && target.observedSeq > 0 {
+		if source.observedSeq < target.observedSeq {
+			return target
+		}
+	} else if source.ObservedAt.Before(target.ObservedAt) {
 		return target
 	}
 	target.ObservedAt = source.ObservedAt
 	target.Signals = source.Clone().Signals
 	target.observedSeq = source.observedSeq
 	return target
+}
+
+// replaceModelStateKeepingObservation replaces state with a restored or fresh
+// cooldown state but keeps the newer of the two passive quota observations: a
+// cooldown transition must never roll the upstream watermark back.
+func replaceModelStateKeepingObservation(state *ModelState, replacement ModelState) {
+	if state == nil {
+		return
+	}
+	observation := state.Quota
+	*state = replacement
+	state.Quota = mergeQuotaObservation(state.Quota, observation)
 }

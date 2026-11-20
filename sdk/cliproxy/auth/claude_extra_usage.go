@@ -36,7 +36,7 @@ func ApplyClaudeExtraUsageMetadata(auth *Auth) {
 	raw, _ := rawValue.(string)
 	value := internalconfig.NormalizeClaudeExtraUsage(raw)
 	if value == "" {
-		if present && rawValue != nil {
+		if present && rawValue != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
 			log.Warnf("auth %s: unrecognized extra_usage %v (supported: allow, block); using claude.extra-usage", auth.ID, rawValue)
 		}
 		return
@@ -67,7 +67,9 @@ func claudeExtraUsageBlocked(cfg *internalconfig.Config, auth *Auth) bool {
 // on the next request. Once no other credential can serve the request, the client
 // receives a 429 that carries the plan's reset time.
 func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now time.Time) error {
-	if auth == nil || executorKeyFromAuth(auth) != "claude" || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
+	// Extra usage belongs to subscription credentials; an API key is always
+	// billed at API rates, so the policy never applies to it.
+	if auth == nil || executorKeyFromAuth(auth) != "claude" || isAPIKeyAuth(auth) || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
 		return nil
 	}
 	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel)

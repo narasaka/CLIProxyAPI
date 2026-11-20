@@ -837,16 +837,25 @@ func (e *credentialTerminatedError) Error() string {
 	return e.terminal.Error()
 }
 
-// applyRequestAfterAuth runs the built-in per-credential request checks, then the
-// plugin after-auth interceptor. Both refuse a credential the same way. Token
-// counting is not billed, so the extra-usage check skips it.
+// applyRequestAfterAuth runs the built-in per-credential request checks around
+// the plugin after-auth interceptor. Both refuse a credential the same way. The
+// extra-usage check runs again after the interceptor, which may wait while
+// another response records a block. Token counting is not billed, so it skips
+// the extra-usage check.
 func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel string, countTokens bool, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
 	if !countTokens {
 		if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
 			return req, opts, errRefuse
 		}
 	}
-	return applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
+	req, opts, errIntercept := applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
+	if errIntercept != nil || countTokens || opts.RequestAfterAuthInterceptor == nil {
+		return req, opts, errIntercept
+	}
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+		return req, opts, errRefuse
+	}
+	return req, opts, nil
 }
 
 // refusalOutlastsWait reports whether lastErr is a refusal whose credential

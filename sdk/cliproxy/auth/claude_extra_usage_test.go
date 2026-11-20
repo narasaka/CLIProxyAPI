@@ -1188,3 +1188,88 @@ func TestClaudeExtraUsageSnapshotChoiceFollowsHeaderArrival(t *testing.T) {
 		t.Fatal("an older response recorded later hid the newer extra-usage snapshot")
 	}
 }
+
+func TestClaudeExtraUsageBlockRecordedDuringAfterAuthInterceptorIsHonored(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			model := "claude-extra-usage-interceptor-" + mode
+			manager, executor, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+			opts := cliproxyexecutor.Options{
+				RequestAfterAuthInterceptor: func(_ context.Context, req cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
+					if authID, _ := req.Metadata[cliproxyexecutor.SelectedAuthMetadataKey].(string); authID == "cred-a" {
+						// Another response on cred-a crosses the limit while the plugin runs.
+						live, _ := manager.GetByID("cred-a")
+						manager.observeClaudeResponseHeaders(Result{AuthID: "cred-a", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
+							"claude", model, http.Header{
+								"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
+								"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
+								"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
+								"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
+							}, 1<<62)
+					}
+					return cliproxyexecutor.RequestAfterAuthInterceptResponse{}
+				},
+			}
+			payload, errInvoke := invokeAfterAuthMode(manager, "claude", model, mode, opts)
+			if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
+				t.Fatalf("executor calls = %v (payload %q, error %v), want only cred-b", calls, payload, errInvoke)
+			}
+		})
+	}
+}
+
+func TestClaudeExtraUsageModelBlockSurvivesCooldownUnwrap(t *testing.T) {
+	const model = "claude-extra-usage-unwrap-opus"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	allowed := map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"}
+	minute, fiveSeconds := time.Minute, 5*time.Second
+
+	// An independent model failure is live when a credential-wide quota wraps it.
+	manager.MarkResult(claudeHeadersContext(t, allowed), Result{AuthID: "cred-a", Provider: "claude", Model: model,
+		Error: &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "capacity"}, RetryAfter: &minute})
+	manager.MarkResult(claudeHeadersContext(t, map[string]string{"Retry-After": "5"}), Result{AuthID: "cred-a", Provider: "claude",
+		Model: "claude-extra-usage-unwrap-sonnet", CredentialScope: true, Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}, RetryAfter: &fiveSeconds})
+	// An older attempt got allowed headers; its result is recorded later.
+	delayed := claudeHeadersContext(t, allowed)
+	// A request already sent crosses the model's weekly limit; its headers arrive now.
+	attempt, _ := manager.GetByID("cred-a")
+	crossing := internallogging.WithFreshResponseHeadersHolder(WithSkipPersist(t.Context()))
+	manager.watchClaudeResponseHeaders(crossing, attempt, "", "claude", model)
+	headers := http.Header{}
+	for key, value := range claudeExtraUsageSignals(time.Now(), map[string]string{
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+		"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+	}) {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(crossing, headers)
+	before, _ := manager.GetByID("cred-a")
+	if before.ModelStates[model].credentialQuotaShadow == nil || manager.claudeExtraUsageRefusal(before, model, time.Now()) == nil {
+		t.Fatal("setup: want a wrapped model state that is blocked")
+	}
+
+	// The credential wrap expires, then the older result unwraps the model state.
+	manager.mu.Lock()
+	manager.auths["cred-a"].Quota.NextRecoverAt = time.Now().Add(-time.Second)
+	manager.mu.Unlock()
+	manager.MarkResult(delayed, Result{AuthID: "cred-a", Provider: "claude", Model: model,
+		Error: &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "capacity"}, RetryAfter: &minute})
+	after, _ := manager.GetByID("cred-a")
+	if manager.claudeExtraUsageRefusal(after, model, time.Now()) == nil {
+		t.Fatalf("the cooldown unwrap rolled back the newer model block; model signals = %v", after.ModelStates[model].Quota.Signals)
+	}
+}
+
+func TestClaudeExtraUsageNeverRefusesAPIKeyCredentials(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+	signals := claudeExtraUsageSignals(time.Now(), nil)
+	apiKey := &Auth{ID: "key", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindAPIKey}, Quota: QuotaState{Signals: signals}}
+	if errRefuse := manager.claudeExtraUsageRefusal(apiKey, "claude-model", time.Now()); errRefuse != nil {
+		t.Fatalf("API-key credential refused: %v", errRefuse)
+	}
+	oauth := &Auth{ID: "seat", Provider: "claude", Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth}, Quota: QuotaState{Signals: signals}}
+	if errRefuse := manager.claudeExtraUsageRefusal(oauth, "claude-model", time.Now()); errRefuse == nil {
+		t.Fatal("OAuth subscription credential not refused")
+	}
+}
