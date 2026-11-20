@@ -1277,3 +1277,81 @@ func TestClaudeExtraUsageNeverRefusesAPIKeyCredentials(t *testing.T) {
 		}
 	}
 }
+
+// claudeVerifyFallbackExecutor answers verification's stream with 501 after a
+// concurrent response has recorded that cred-a is in extra usage.
+type claudeVerifyFallbackExecutor struct {
+	*afterAuthTestExecutor
+	manager *Manager
+	model   string
+}
+
+func (e *claudeVerifyFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.manager.observeClaudeResponseHeaders(Result{AuthID: auth.ID, RegistrationEpoch: auth.RegistrationEpoch, CredentialVersion: auth.CredentialVersion},
+		"claude", e.model, http.Header{
+			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
+			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
+			"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
+		}, 1<<62)
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "streaming not supported"}
+}
+
+func TestClaudeExtraUsageVerificationFallbackHonorsBlock(t *testing.T) {
+	const model = "claude-extra-usage-verify-fallback"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	executor := &claudeVerifyFallbackExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, manager: manager, model: model}
+	manager.RegisterExecutor(executor)
+
+	_, errVerify := manager.VerifyInference(t.Context(), "cred-a", model)
+	var cooldown *modelCooldownError
+	if !errors.As(errVerify, &cooldown) || cooldown == nil {
+		t.Fatalf("VerifyInference error = %v (%T), want the plan-limit 429", errVerify, errVerify)
+	}
+	if calls := executor.Calls(); len(calls) != 0 {
+		t.Fatalf("non-streaming fallback sent despite the block: calls = %v", calls)
+	}
+}
+
+func TestClaudeExtraUsageBlockSurvivesConfigCredentialReload(t *testing.T) {
+	const model = "claude-extra-usage-reload"
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+	configSeat := func(priority string) *Auth {
+		return &Auth{ID: "seat", Provider: "claude", Status: StatusActive, Attributes: map[string]string{
+			AttributeAuthKind: AuthKindAPIKey, AttributeAPIKey: "sk-ant-oat01-seat", "priority": priority,
+		}}
+	}
+	registry.GetGlobalRegistry().RegisterClient("seat", "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("seat") })
+	if _, errReg := manager.Register(WithSkipPersist(t.Context()), configSeat("0")); errReg != nil {
+		t.Fatal(errReg)
+	}
+	live, _ := manager.GetByID("seat")
+	manager.observeClaudeResponseHeaders(Result{AuthID: "seat", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
+		"claude", "claude-extra-usage-reload-other", http.Header{
+			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
+			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
+			"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
+		}, 1<<62)
+
+	// A config reload rebuilds the same credential with a new priority.
+	if _, errUpd := manager.Update(WithSkipPersist(t.Context()), configSeat("5")); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	reloaded, _ := manager.GetByID("seat")
+	if errRefuse := manager.claudeExtraUsageRefusal(reloaded, model, time.Now()); errRefuse == nil {
+		t.Fatalf("config reload erased the shared block; signals = %v", reloaded.Quota.Signals)
+	}
+	// New credentials under the same ID do not inherit the credential-level snapshot.
+	replaced := configSeat("5")
+	replaced.Attributes[AttributeAPIKey] = "sk-ant-oat01-other-seat"
+	if _, errUpd := manager.Update(WithSkipPersist(t.Context()), replaced); errUpd != nil {
+		t.Fatal(errUpd)
+	}
+	other, _ := manager.GetByID("seat")
+	if errRefuse := manager.claudeExtraUsageRefusal(other, model, time.Now()); errRefuse != nil {
+		t.Fatalf("a different credential inherited the old block: %v", errRefuse)
+	}
+}

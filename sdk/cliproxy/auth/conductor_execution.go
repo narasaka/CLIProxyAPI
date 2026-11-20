@@ -3457,6 +3457,10 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	if errStream != nil {
 		rerr := resultErrorFromError(errStream)
 		if rerr != nil && rerr.HTTPStatus == http.StatusNotImplemented {
+			// The fallback is another billed request; honor a block recorded meanwhile.
+			if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+				return auth, unwrapExecutionBoundaryError(errRefuse)
+			}
 			opts.Stream = false
 			resp, errExec := executor.Execute(execCtx, auth, req, opts)
 			rerrExec := resultErrorFromError(errExec)
