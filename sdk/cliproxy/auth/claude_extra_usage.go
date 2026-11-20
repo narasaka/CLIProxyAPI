@@ -32,9 +32,13 @@ func ApplyClaudeExtraUsageMetadata(auth *Auth) {
 		return
 	}
 	delete(auth.Attributes, AttributeClaudeExtraUsage)
-	raw, _ := auth.Metadata[AttributeClaudeExtraUsage].(string)
+	rawValue, present := auth.Metadata[AttributeClaudeExtraUsage]
+	raw, _ := rawValue.(string)
 	value := internalconfig.NormalizeClaudeExtraUsage(raw)
 	if value == "" {
+		if present && rawValue != nil {
+			log.Warnf("auth %s: unrecognized extra_usage %v (supported: allow, block); using claude.extra-usage", auth.ID, rawValue)
+		}
 		return
 	}
 	if auth.Attributes == nil {
@@ -98,10 +102,10 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (cred
 	}
 	m.mu.RLock()
 	if live := m.auths[auth.ID]; live != nil {
-		if live.Quota.ObservedAt.After(credentialQuota.ObservedAt) {
+		if observationIsNewer(live.Quota, credentialQuota) {
 			credentialQuota = live.Quota
 		}
-		if state := existingModelState(live, stateModel); state != nil && state.Quota.ObservedAt.After(modelQuota.ObservedAt) {
+		if state := existingModelState(live, stateModel); state != nil && observationIsNewer(state.Quota, modelQuota) {
 			modelQuota = state.Quota
 		}
 	}
@@ -110,31 +114,46 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (cred
 	return credential, model
 }
 
-// observeClaudeStreamHeaders records a started Claude stream's rate-limit headers
-// right away. The stream's result is recorded only when it ends, so otherwise a
-// response showing the plan limit used up would not block new requests for as
-// long as that stream runs. Arrival ordering keeps the later result from
-// replacing anything newer, and the same staleness check as MarkResult keeps a
-// stream from a replaced credential from writing onto its successor.
-func (m *Manager) observeClaudeStreamHeaders(ctx context.Context, attempt *Auth, accessToken, provider, model string) {
+// observationIsNewer reports whether candidate's snapshot is newer than current's:
+// by header arrival when both carry one, since recording order can differ from
+// arrival order, and by observation time otherwise.
+func observationIsNewer(candidate, current QuotaState) bool {
+	if candidate.observedSeq > 0 && current.observedSeq > 0 {
+		return candidate.observedSeq > current.observedSeq
+	}
+	return candidate.ObservedAt.After(current.ObservedAt)
+}
+
+// watchClaudeResponseHeaders records a local Claude attempt's rate-limit headers
+// the moment they arrive. A result is recorded only after the whole response
+// (or stream) is done, so otherwise a response showing the plan limit used up
+// would not block new requests for as long as it runs. Arrival ordering keeps the
+// later result from replacing anything newer, and the same staleness check as
+// MarkResult keeps an attempt on a replaced credential off its successor.
+func (m *Manager) watchClaudeResponseHeaders(ctx context.Context, attempt *Auth, accessToken, provider, model string) {
 	if m == nil || attempt == nil || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
 		return
 	}
-	headers, arrival := internallogging.GetResponseHeadersWithArrival(ctx)
-	if len(headers) == 0 {
-		return
-	}
-	now := time.Now()
-	attemptIdentity := Result{
+	identity := Result{
 		AuthID:            attempt.ID,
 		AccessToken:       accessToken,
 		CredentialVersion: attempt.CredentialVersion,
 		RegistrationEpoch: attempt.RegistrationEpoch,
 	}
+	internallogging.ObserveResponseHeaders(ctx, func(headers http.Header, arrival uint64) {
+		m.observeClaudeResponseHeaders(identity, provider, model, headers, arrival)
+	})
+}
+
+func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model string, headers http.Header, arrival uint64) {
+	if len(headers) == 0 {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	auth := m.auths[attempt.ID]
-	if auth == nil || isStaleExecutionResult(attemptIdentity, auth) {
+	now := time.Now()
+	auth := m.auths[identity.AuthID]
+	if auth == nil || isStaleExecutionResult(identity, auth) {
 		return
 	}
 	auth.Quota.observeResultHeaders(provider, headers, arrival, now)

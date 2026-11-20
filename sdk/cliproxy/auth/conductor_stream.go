@@ -572,6 +572,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			return errRefuse
 		}
+		if !ephemeralResult {
+			m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel)
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -598,6 +601,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					executionSeq = m.nextExecutionSeq()
 					accessToken = authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 					startRetry := time.Now()
+					if !ephemeralResult {
+						m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel)
+					}
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 					if hasUpstreamExecutionAttempt(errStream) {
@@ -660,10 +666,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		// Headers are in hand once the stream is open; the first payload can lag.
-		if !ephemeralResult {
-			m.observeClaudeStreamHeaders(ctx, auth, accessToken, provider, resultModel)
-		}
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		bootstrapErr = markUpstreamExecutionAttemptFromContext(ctx, bootstrapErr)
 		if hasUpstreamExecutionAttempt(bootstrapErr) {
@@ -691,6 +693,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					executionSeq = m.nextExecutionSeq()
 					accessToken = authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 					startRetry := time.Now()
+					if !ephemeralResult {
+						m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel)
+					}
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
@@ -830,9 +835,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-		if !ephemeralResult {
-			m.observeClaudeStreamHeaders(ctx, auth, accessToken, provider, resultModel)
-		}
 		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, routeModel, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult, execOpts, executionSeq), nil
 	}
 	if lastErr == nil {

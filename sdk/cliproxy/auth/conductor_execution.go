@@ -1319,6 +1319,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			upstreamBeforeAttempt := upstreamErr
+			m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -1347,6 +1348,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel)
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
@@ -3441,6 +3443,7 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	credVersion := auth.CredentialVersion
 	regEpoch := auth.RegistrationEpoch
 
+	m.watchClaudeResponseHeaders(execCtx, auth, accessToken, provider, stateModel)
 	streamRes, errStream := executor.ExecuteStream(execCtx, auth, req, opts)
 	if errStream != nil {
 		rerr := resultErrorFromError(errStream)

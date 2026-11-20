@@ -888,7 +888,13 @@ func TestClaudeExtraUsageStreamFromReplacedCredentialIsIgnored(t *testing.T) {
 	if replacement.RegistrationEpoch <= attempt.RegistrationEpoch {
 		t.Fatalf("replacement epoch %d not newer than %d", replacement.RegistrationEpoch, attempt.RegistrationEpoch)
 	}
-	manager.observeClaudeStreamHeaders(claudeHeadersContext(t, claudeExtraUsageSignals(time.Now(), nil)), attempt, "", "claude", model)
+	ctx := internallogging.WithFreshResponseHeadersHolder(WithSkipPersist(t.Context()))
+	manager.watchClaudeResponseHeaders(ctx, attempt, "", "claude", model)
+	headers := http.Header{}
+	for key, value := range claudeExtraUsageSignals(time.Now(), nil) {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
 
 	current, _ := manager.GetByID("cred-a")
 	if errRefuse := manager.claudeExtraUsageRefusal(current, model, time.Now()); errRefuse != nil {
@@ -1071,5 +1077,114 @@ func TestClaudeExtraUsageRefreshRetryRefusalReportsPlanLimit(t *testing.T) {
 				t.Fatalf("error = %v (%T), want the plan-limit 429", errInvoke, errInvoke)
 			}
 		})
+	}
+}
+
+// claudeHeldBodyExecutor reports extra-usage headers at once and holds the rest
+// of a non-streaming response, or ends a stream without a completed response.
+type claudeHeldBodyExecutor struct {
+	*afterAuthTestExecutor
+	release chan struct{}
+}
+
+func (e *claudeHeldBodyExecutor) setHeaders(ctx context.Context) {
+	headers := http.Header{}
+	for key, value := range claudeExtraUsageSignals(time.Now(), nil) {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
+}
+
+func (e *claudeHeldBodyExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if auth.ID != "cred-a" {
+		return e.afterAuthTestExecutor.Execute(ctx, auth, req, opts)
+	}
+	e.record(auth)
+	e.setHeaders(ctx)
+	<-e.release
+	return cliproxyexecutor.Response{Payload: []byte("ok:" + auth.ID)}, nil
+}
+
+func (e *claudeHeldBodyExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.record(auth)
+	e.setHeaders(ctx)
+	chunks := make(chan cliproxyexecutor.StreamChunk)
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestClaudeExtraUsageBlockAppliesWhileANonStreamingResponseIsBuffered(t *testing.T) {
+	const model = "claude-extra-usage-buffered"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	executor := &claudeHeldBodyExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, release: make(chan struct{})}
+	manager.RegisterExecutor(executor)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, errExec := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		firstDone <- errExec
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		auth, _ := manager.GetByID("cred-a")
+		if auth != nil && manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil {
+			break
+		}
+		select {
+		case <-deadline:
+			close(executor.release)
+			t.Fatal("block not recorded while the crossing response body was still being read")
+		default:
+			runtime.Gosched()
+		}
+	}
+	payload, errExec := invokeAfterAuthMode(manager, "claude", model, "execute", cliproxyexecutor.Options{})
+	close(executor.release)
+	if errFirst := <-firstDone; errFirst != nil {
+		t.Fatalf("crossing request error = %v", errFirst)
+	}
+	if errExec != nil || string(payload) != "ok:cred-b" {
+		t.Fatalf("request during the crossing response: payload = %q, error = %v, want ok:cred-b", payload, errExec)
+	}
+}
+
+func TestClaudeExtraUsageIncompleteVerificationRecordsBlock(t *testing.T) {
+	const model = "claude-extra-usage-verify-incomplete"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	executor := &claudeHeldBodyExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, release: make(chan struct{})}
+	manager.RegisterExecutor(executor)
+
+	if _, errVerify := manager.VerifyInference(t.Context(), "cred-a", model); errVerify == nil {
+		t.Fatal("VerifyInference() succeeded, want an incomplete-response error")
+	}
+	auth, _ := manager.GetByID("cred-a")
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, model, time.Now()); errRefuse == nil {
+		t.Fatalf("incomplete verification lost its extra-usage headers; signals = %v", auth.Quota.Signals)
+	}
+}
+
+func TestClaudeExtraUsageSnapshotChoiceFollowsHeaderArrival(t *testing.T) {
+	const model = "claude-extra-usage-snapshot-choice"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	live, _ := manager.GetByID("cred-a")
+	// The crossing headers arrived last (stamp 20) but were recorded first.
+	manager.observeClaudeResponseHeaders(Result{AuthID: "cred-a", RegistrationEpoch: live.RegistrationEpoch, CredentialVersion: live.CredentialVersion},
+		"claude", model, http.Header{
+			"Anthropic-Ratelimit-Unified-Status":         {"rejected"},
+			"Anthropic-Ratelimit-Unified-5h-Status":      {"rejected"},
+			"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
+			"Anthropic-Ratelimit-Unified-Reset":          {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)},
+		}, 20)
+	// A scheduler copy holds an older response (stamp 19) that was recorded later.
+	stale := QuotaState{
+		Signals:     map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"},
+		ObservedAt:  time.Now().Add(time.Minute),
+		observedSeq: 19,
+	}
+	picked := live.Clone()
+	picked.Quota = stale
+	picked.ModelStates = map[string]*ModelState{model: {Status: StatusActive, Quota: stale}}
+	if errRefuse := manager.claudeExtraUsageRefusal(picked, model, time.Now()); errRefuse == nil {
+		t.Fatal("an older response recorded later hid the newer extra-usage snapshot")
 	}
 }
