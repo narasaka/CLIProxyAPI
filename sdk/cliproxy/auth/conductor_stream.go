@@ -531,7 +531,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		var errIntercept error
-		execReq, execOpts, errIntercept = m.applyRequestAfterAuth(ctx, executor, auth, provider, resultModel, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		execReq, execOpts, errIntercept = m.applyRequestAfterAuth(ctx, executor, auth, provider, resultModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		if errIntercept != nil {
 			if isCredentialTerminatedError(errIntercept) {
 				if auth != nil {

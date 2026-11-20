@@ -81,7 +81,7 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 		"reset_at": resetAt.Format(time.RFC3339),
 	}).Debug("claude extra-usage blocked: skipping credential whose plan limit is used up")
 	cooldown := newModelCooldownErrorForCandidates(stateModel, "claude", resetAt.Sub(now), errClaudeExtraUsageBlocked, true, claudeExtraUsageRefusalSignals(signals))
-	return &credentialTerminatedError{terminal: cooldown}
+	return &credentialTerminatedError{terminal: cooldown, recoverAt: resetAt}
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's
@@ -92,7 +92,7 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 // sharedOnly limits the match to the plan-wide 5h and 7d windows. A per-model
 // weekly window (a seven_day_* claim) only bills that model as extra usage, so the
 // credential-level snapshot, which reflects whichever model ran last, must not
-// block every other model on it.
+// block every other model on it, nor for longer than the shared windows last.
 //
 // Without a future reset no block applies: blocked credentials receive no traffic,
 // so an open-ended block would never see the response that lifts it.
@@ -110,22 +110,22 @@ func claudeExtraUsageResetAt(signals map[string]string, sharedOnly bool, now tim
 	if !isAllowedClaudeWindowStatus(headers.Get("Anthropic-Ratelimit-Unified-Overage-Status")) {
 		return time.Time{}, false
 	}
-	rejectedWindows := rejectedClaudeUnifiedWindows(headers)
-	if sharedOnly {
-		claim := strings.ToLower(strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-Representative-Claim")))
-		shared := !strings.HasPrefix(claim, "seven_day_")
-		for _, window := range rejectedWindows {
-			if window == "5h" || window == "7d" {
-				shared = true
-			}
-		}
-		if !shared {
-			return time.Time{}, false
+	claim := strings.ToLower(strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-Representative-Claim")))
+	var resetHeaders []string
+	sharedWindowRejected, modelWindowRejected := false, false
+	for _, window := range rejectedClaudeUnifiedWindows(headers) {
+		shared := window == "5h" || window == "7d"
+		sharedWindowRejected = sharedWindowRejected || shared
+		modelWindowRejected = modelWindowRejected || !shared
+		if !sharedOnly || shared {
+			resetHeaders = append(resetHeaders, claudeUnifiedWindowHeader(window, "Reset"))
 		}
 	}
-	resetHeaders := []string{"Anthropic-Ratelimit-Unified-Reset"}
-	for _, window := range rejectedWindows {
-		resetHeaders = append(resetHeaders, claudeUnifiedWindowHeader(window, "Reset"))
+	// The unified reset belongs to the representative claim. Without a claim it is
+	// shared unless the only rejected windows are per-model ones.
+	unifiedShared := !strings.HasPrefix(claim, "seven_day_") && (claim != "" || sharedWindowRejected || !modelWindowRejected)
+	if !sharedOnly || unifiedShared {
+		resetHeaders = append(resetHeaders, "Anthropic-Ratelimit-Unified-Reset")
 	}
 	var latest time.Time
 	for _, name := range resetHeaders {

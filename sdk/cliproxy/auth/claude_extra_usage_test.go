@@ -7,12 +7,20 @@ import (
 	"net/http"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func claudeExtraUsageSignals(now time.Time, overrides map[string]string) map[string]string {
@@ -59,6 +67,40 @@ func TestClaudeExtraUsageResetAt(t *testing.T) {
 		{
 			name:       "per-model weekly claim does not block the whole credential",
 			overrides:  map[string]string{"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus", "Anthropic-Ratelimit-Unified-5h-Status": "allowed"},
+			sharedOnly: true,
+		},
+		{
+			name: "shared deadline ignores a per-model weekly reset",
+			overrides: map[string]string{
+				"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+				"Anthropic-Ratelimit-Unified-Reset":                at(6 * 24 * time.Hour),
+				"Anthropic-Ratelimit-Unified-5h-Reset":             at(time.Hour),
+				"Anthropic-Ratelimit-Unified-7d_opus-Status":       "rejected",
+				"Anthropic-Ratelimit-Unified-7d_opus-Reset":        at(6 * 24 * time.Hour),
+			},
+			sharedOnly: true,
+			want:       time.Hour,
+			blocked:    true,
+		},
+		{
+			name: "model deadline keeps the per-model weekly reset",
+			overrides: map[string]string{
+				"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+				"Anthropic-Ratelimit-Unified-Reset":                at(6 * 24 * time.Hour),
+				"Anthropic-Ratelimit-Unified-5h-Reset":             at(time.Hour),
+				"Anthropic-Ratelimit-Unified-7d_opus-Status":       "rejected",
+				"Anthropic-Ratelimit-Unified-7d_opus-Reset":        at(6 * 24 * time.Hour),
+			},
+			want:    6 * 24 * time.Hour,
+			blocked: true,
+		},
+		{
+			name: "stale shared rejection does not extend a per-model block to the credential",
+			overrides: map[string]string{
+				"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+				"Anthropic-Ratelimit-Unified-Reset":                at(6 * 24 * time.Hour),
+				"Anthropic-Ratelimit-Unified-5h-Reset":             at(-time.Minute),
+			},
 			sharedOnly: true,
 		},
 		{
@@ -250,5 +292,203 @@ func TestClaudeExtraUsageModelSnapshotBlocksOnlyThatModel(t *testing.T) {
 	}
 	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-sonnet-test", now); errRefuse != nil {
 		t.Fatalf("sonnet refusal = %v, want none", errRefuse)
+	}
+}
+
+func TestClaudeExtraUsageAllRefusedReportsEarliestReset(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		for _, soonFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/soon-first=%t", mode, soonFirst), func(t *testing.T) {
+				model := fmt.Sprintf("claude-extra-usage-earliest-%s-%t", mode, soonFirst)
+				now := time.Now()
+				at := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+				soon := claudeExtraUsageSignals(now, map[string]string{
+					"Anthropic-Ratelimit-Unified-Reset":    at(10 * time.Minute),
+					"Anthropic-Ratelimit-Unified-5h-Reset": at(10 * time.Minute),
+				})
+				late := claudeExtraUsageSignals(now, map[string]string{
+					"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day",
+					"Anthropic-Ratelimit-Unified-Reset":                at(5 * 24 * time.Hour),
+					"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+					"Anthropic-Ratelimit-Unified-7d-Status":            "rejected",
+					"Anthropic-Ratelimit-Unified-7d-Reset":             at(5 * 24 * time.Hour),
+				})
+				signals := map[string]map[string]string{"cred-a": late, "cred-b": soon}
+				if soonFirst {
+					signals = map[string]map[string]string{"cred-a": soon, "cred-b": late}
+				}
+				manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", signals)
+
+				_, errInvoke := invokeAfterAuthMode(manager, "claude", model, mode, cliproxyexecutor.Options{})
+				var cooldown *modelCooldownError
+				if !errors.As(errInvoke, &cooldown) || cooldown == nil {
+					t.Fatalf("error = %v (%T), want *modelCooldownError", errInvoke, errInvoke)
+				}
+				retryAfter, errAtoi := strconv.Atoi(cooldown.Headers().Get("Retry-After"))
+				if errAtoi != nil || retryAfter > int((10*time.Minute).Seconds()) || retryAfter < int((9*time.Minute).Seconds()) {
+					t.Fatalf("Retry-After = %q, want the earliest reset (~10m)", cooldown.Headers().Get("Retry-After"))
+				}
+			})
+		}
+	}
+}
+
+// claudeExtraUsageHomeDispatcher hands out Claude credentials carrying the
+// rate-limit headers observed on their last response.
+type claudeExtraUsageHomeDispatcher struct {
+	mu      sync.Mutex
+	authIDs []string
+	signals map[string]map[string]string
+}
+
+func (*claudeExtraUsageHomeDispatcher) HeartbeatOK() bool { return true }
+
+func (*claudeExtraUsageHomeDispatcher) AbortAmbiguousDispatch() {}
+
+func (d *claudeExtraUsageHomeDispatcher) RPopAuth(ctx context.Context, model string, sessionID string, headers http.Header, count int) ([]byte, error) {
+	return d.RPopAuthWithConstraints(ctx, model, sessionID, headers, count, nil, "")
+}
+
+func (d *claudeExtraUsageHomeDispatcher) RPopAuthWithConstraints(_ context.Context, _ string, _ string, _ http.Header, _ int, excludedAuthIDs []string, _ string) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	excluded := make(map[string]struct{}, len(excludedAuthIDs))
+	for _, authID := range excludedAuthIDs {
+		excluded[authID] = struct{}{}
+	}
+	for _, authID := range d.authIDs {
+		if _, ok := excluded[authID]; ok {
+			continue
+		}
+		return json.Marshal(homeAuthDispatchResponse{Auth: Auth{
+			ID:       authID,
+			Provider: "claude",
+			Status:   StatusActive,
+			Quota:    QuotaState{Signals: d.signals[authID]},
+		}})
+	}
+	return nil, home.ErrAuthNotFound
+}
+
+func TestClaudeExtraUsageHomeModeBlocksExecutionButNotTokenCounting(t *testing.T) {
+	for _, mode := range []string{"execute", "count"} {
+		t.Run(mode, func(t *testing.T) {
+			executor := &afterAuthTestExecutor{id: "claude"}
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{
+				Home:   internalconfig.HomeConfig{Enabled: true},
+				Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"},
+			})
+			manager.SetRetryConfig(2, 0, 5)
+			manager.RegisterExecutor(executor)
+			dispatcher := &claudeExtraUsageHomeDispatcher{
+				authIDs: []string{"cred-a", "cred-b"},
+				signals: map[string]map[string]string{"cred-a": claudeExtraUsageSignals(time.Now(), nil)},
+			}
+			manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+
+			payload, errInvoke := invokeAfterAuthMode(manager, "claude", "claude-extra-usage-home-"+mode, mode, cliproxyexecutor.Options{})
+			if errInvoke != nil {
+				t.Fatalf("invoke error = %v", errInvoke)
+			}
+			want, wantCalls := "ok:cred-b", []string{"cred-b"}
+			if mode == "count" {
+				want, wantCalls = "count:cred-a", []string{"cred-a"}
+			}
+			if string(payload) != want || !reflect.DeepEqual(executor.Calls(), wantCalls) {
+				t.Fatalf("payload = %q, calls = %v, want %q via %v", payload, executor.Calls(), want, wantCalls)
+			}
+		})
+	}
+}
+
+func TestClaudeExtraUsageRefusalYieldsToShorterCooldown(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			model := "claude-extra-usage-short-cooldown-" + mode
+			now := time.Now()
+			manager, executor, _ := newClaudeExtraUsageTestManager(t, model, "block", map[string]map[string]string{
+				"cred-a": claudeExtraUsageSignals(now, nil),
+			})
+			// cred-b is healthy but briefly cooling down after an ordinary rate limit.
+			// Without waiting for it, the request must report cred-b's short cooldown
+			// rather than cred-a's plan reset hours away.
+			manager.SetRetryConfig(2, 0, 0)
+			manager.MarkResult(WithSkipPersist(t.Context()), Result{
+				AuthID:     "cred-b",
+				Provider:   "claude",
+				Model:      model,
+				RouteModel: model,
+				Error:      &Error{Code: "rate_limit", Message: "slow down", HTTPStatus: http.StatusTooManyRequests, Retryable: true},
+			})
+
+			_, errInvoke := invokeAfterAuthMode(manager, "claude", model, mode, cliproxyexecutor.Options{})
+			var cooldown *modelCooldownError
+			if !errors.As(errInvoke, &cooldown) || cooldown == nil {
+				t.Fatalf("error = %v (%T), want *modelCooldownError", errInvoke, errInvoke)
+			}
+			if cooldown.resetIn <= 0 || cooldown.resetIn > time.Minute {
+				t.Fatalf("reported reset in %v, want cred-b's short cooldown", cooldown.resetIn)
+			}
+			if len(executor.Calls()) != 0 {
+				t.Fatalf("executor calls = %v, want none", executor.Calls())
+			}
+		})
+	}
+}
+
+func TestClaudeExtraUsageBlockedThreadOwnerAsksForReplay(t *testing.T) {
+	const model = "claude-extra-usage-thread"
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			caller := t.Name() + "-" + uuid.NewString()
+			msgID := "msg_thread_" + uuid.NewString()
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+			manager.SetRetryConfig(0, 0, 0)
+			owner, other := registerClaudeThreadTestAuths(t, manager, caller, model)
+			ownerCopy := owner.Clone()
+			ownerCopy.Quota.Signals = claudeExtraUsageSignals(time.Now(), nil)
+			if _, errUpd := manager.Update(WithSkipPersist(t.Context()), ownerCopy); errUpd != nil {
+				t.Fatal(errUpd)
+			}
+			var calls []string
+			manager.RegisterExecutor(&claudeThreadTestExecutor{
+				executeFunc: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					calls = append(calls, auth.ID)
+					return cliproxyexecutor.Response{Payload: []byte(`{"id":"msg_ok"}`)}, nil
+				},
+				streamFunc: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+					calls = append(calls, auth.ID)
+					ch := make(chan cliproxyexecutor.StreamChunk, 1)
+					ch <- cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"message_stop"}` + "\n\n")}
+					close(ch)
+					return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+				},
+			})
+			opts := cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FormatClaude,
+				Stream:       stream,
+				Metadata:     map[string]any{cliproxyexecutor.CallerScopeMetadataKey: caller},
+			}
+			cliproxysession.RememberClaudeThreadAuth(cliproxysession.ClaudeThreadCallerScope("", opts.Metadata), msgID, owner.ID)
+			req := cliproxyexecutor.Request{
+				Model:   model,
+				Payload: []byte(`{"model":"` + model + `","thread":{"type":"continue","previous_message_id":"` + msgID + `"},"messages":[{"role":"user","content":"next"}]}`),
+			}
+
+			var errExec error
+			if stream {
+				errExec = executeStreamToResult(WithSkipPersist(t.Context()), manager, req, opts)
+			} else {
+				_, errExec = manager.Execute(WithSkipPersist(t.Context()), []string{"claude"}, req, opts)
+			}
+			if !clienterror.IsClaudeThreadNotFound(statusCodeFromError(errExec), errExec) {
+				t.Fatalf("error = %v (status %d), want thread_not_found replay", errExec, statusCodeFromError(errExec))
+			}
+			if len(calls) != 0 {
+				t.Fatalf("executor calls = %v (other=%s), want none", calls, other.ID)
+			}
+		})
 	}
 }

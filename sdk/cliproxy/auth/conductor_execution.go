@@ -214,6 +214,9 @@ func unwrapExecutionBoundaryError(err error) error {
 }
 
 func roundPickFailureError(lastErr, upstreamErr, errPick error) error {
+	if upstreamErr == nil && pickCooldownEndsBeforeRefusal(lastErr, errPick, time.Now()) {
+		return errPick
+	}
 	preferred := preferredExecutionAttemptError(lastErr, upstreamErr)
 	if isSchedulerRejectError(errPick) {
 		return markRoundEndedBySchedulerReject(preferred)
@@ -351,7 +354,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		if isCredentialTerminatedError(errExec) {
 			if preferredUpstreamErr == nil {
-				return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
+				errRefused := unwrapExecutionBoundaryError(errExec)
+				if pinnedThread {
+					errRefused = claudeThreadReplayError(errRefused)
+				}
+				return cliproxyexecutor.Response{}, errRefused
 			}
 			break
 		}
@@ -656,7 +663,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		if isCredentialTerminatedError(errStream) {
 			if preferredUpstreamErr == nil {
-				return nil, unwrapExecutionBoundaryError(errStream)
+				errRefused := unwrapExecutionBoundaryError(errStream)
+				if pinnedThread {
+					errRefused = claudeThreadReplayError(errRefused)
+				}
+				return nil, errRefused
 			}
 			break
 		}
@@ -811,9 +822,11 @@ type requestToFormatResolver interface {
 
 // credentialTerminatedError refuses one credential for the current request
 // without changing its availability. terminal is the client-facing error used
-// when no other credential serves the request.
+// when no other credential serves the request. recoverAt is set when the refusal
+// knows when the credential becomes usable again.
 type credentialTerminatedError struct {
-	terminal error
+	terminal  error
+	recoverAt time.Time
 }
 
 func (e *credentialTerminatedError) Error() string {
@@ -824,12 +837,43 @@ func (e *credentialTerminatedError) Error() string {
 }
 
 // applyRequestAfterAuth runs the built-in per-credential request checks, then the
-// plugin after-auth interceptor. Both refuse a credential the same way.
-func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
-	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
-		return req, opts, errRefuse
+// plugin after-auth interceptor. Both refuse a credential the same way. Token
+// counting is not billed, so the extra-usage check skips it.
+func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel string, countTokens bool, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	if !countTokens {
+		if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+			return req, opts, errRefuse
+		}
 	}
 	return applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
+}
+
+// pickCooldownEndsBeforeRefusal reports whether the candidates left after a refusal
+// are only cooling down and recover before the refused credential does. Returning
+// the cooldown then lets the normal retry wait serve the request instead of
+// reporting the refused credential's much later recovery.
+func pickCooldownEndsBeforeRefusal(lastErr, errPick error, now time.Time) bool {
+	var refusal *credentialTerminatedError
+	var cooldown *modelCooldownError
+	if !errors.As(lastErr, &refusal) || refusal == nil || refusal.recoverAt.IsZero() ||
+		!errors.As(errPick, &cooldown) || cooldown == nil {
+		return false
+	}
+	return now.Add(cooldown.resetIn).Before(refusal.recoverAt)
+}
+
+// keepEarlierCredentialRefusal returns next unless both errors are refusals with a
+// known recovery time and current recovers first, so a request refused by every
+// credential reports the earliest time any of them can serve again.
+func keepEarlierCredentialRefusal(current, next error) error {
+	var currentRefusal, nextRefusal *credentialTerminatedError
+	if errors.As(current, &currentRefusal) && errors.As(next, &nextRefusal) &&
+		currentRefusal != nil && nextRefusal != nil &&
+		!currentRefusal.recoverAt.IsZero() && !nextRefusal.recoverAt.IsZero() &&
+		currentRefusal.recoverAt.Before(nextRefusal.recoverAt) {
+		return current
+	}
+	return next
 }
 
 func isCredentialTerminatedError(err error) bool {
@@ -1262,7 +1306,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
-			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
 				if isCredentialTerminatedError(errIntercept) {
 					recordRequestRefusedAuth(ctx, auth.ID)
@@ -1359,7 +1403,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
-				lastErr = authErr
+				lastErr = keepEarlierCredentialRefusal(lastErr, authErr)
 				if homeMode {
 					homeAuthCount++
 				}
@@ -1627,7 +1671,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
-				lastErr = authErr
+				lastErr = keepEarlierCredentialRefusal(lastErr, authErr)
 				if homeMode {
 					homeAuthCount++
 				}
@@ -2015,7 +2059,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 						return nil, errEnd
 					}
 				}
-				lastErr = errStream
+				lastErr = keepEarlierCredentialRefusal(lastErr, errStream)
 				if homeMode {
 					homeAuthCount++
 				}
