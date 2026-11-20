@@ -2239,9 +2239,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.UpdatedAt = now
 
 		if !result.SkipQuotaObservation {
-			auth.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now)
+			auth.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now, true)
 			if modelState != nil {
-				modelState.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now)
+				modelState.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now, false)
 			}
 		}
 

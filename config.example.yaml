@@ -565,8 +565,11 @@ upstream:
     # headers, so the request that first goes over the limit, and any requests
     # already sent when its response arrives, are still billed. Blocks are kept in
     # memory, so after a restart each blocked seat may bill one more request before
-    # its next response re-establishes the block. Switching back to allow takes
-    # effect on the next request. Hot-reloadable.
+    # its next response re-establishes the block. A block lasts until the reset
+    # Anthropic reported or a response from a later plan window; if limits come back
+    # sooner, restart or stay on allow until then. Refused seats count toward
+    # max-retry-credentials. Switching back to allow takes effect on the next
+    # request. Hot-reloadable.
     # Override per credential with "extra_usage": "allow" or "block" in its auth file.
     # Real API keys are billed at API rates anyway and are never affected; an OAuth
     # token (sk-ant-oat...) configured under claude-api-key counts as a subscription.

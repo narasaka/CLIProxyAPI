@@ -61,9 +61,15 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 // recording nor dispatch order says which headers are newest; arrival order does.
 // Other providers keep the latest recorded result, as do results whose headers
 // carry no arrival order.
-func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time) {
-	ordered := arrival > 0 && strings.EqualFold(strings.TrimSpace(provider), "claude")
+//
+// credentialLevel marks the credential-wide snapshot, as opposed to a model's.
+func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time, credentialLevel bool) {
+	claude := strings.EqualFold(strings.TrimSpace(provider), "claude")
+	ordered := arrival > 0 && claude
 	if q == nil || (ordered && arrival < q.observedSeq) {
+		return
+	}
+	if claude && keepClaudeExtraUsageSnapshot(q.Signals, headers, credentialLevel, observedAt) {
 		return
 	}
 	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && ordered {

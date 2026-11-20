@@ -626,9 +626,15 @@ func TestClaudeExtraUsageSnapshotsFollowHeaderArrival(t *testing.T) {
 		if !refused(manager) {
 			t.Fatal("a stale stream completion lifted the block")
 		}
-		record(manager, claudeHeadersContext(t, allowed), 3)
+		// A response from the next 5h window lifts the block.
+		nextWindow := map[string]string{
+			"Anthropic-Ratelimit-Unified-Status":    "allowed",
+			"Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+			"Anthropic-Ratelimit-Unified-5h-Reset":  strconv.FormatInt(now.Add(7*time.Hour).Unix(), 10),
+		}
+		record(manager, claudeHeadersContext(t, nextWindow), 3)
 		if refused(manager) {
-			t.Fatal("headers that arrived after the block did not lift it")
+			t.Fatal("a response from the next plan window did not lift the block")
 		}
 	})
 
@@ -1463,5 +1469,31 @@ func TestClaudeExtraUsagePerModelBlockAppliesToPrefixedAliases(t *testing.T) {
 				t.Fatalf("per-model block missed for %s: upstream calls %d -> %d, error = %v", route, calls, len(executor.Calls()), errInvoke)
 			}
 		})
+	}
+}
+
+func TestClaudeExtraUsageSameWindowAllowedResponseKeepsBlock(t *testing.T) {
+	const model = "claude-extra-usage-same-window"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	reset := strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10)
+	refused := func() bool {
+		auth, _ := manager.GetByID("cred-a")
+		return manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) != nil
+	}
+	// Request A was admitted just before the limit was crossed and returns late;
+	// request B crossed it and its headers arrived first.
+	admittedBefore := claudeHeadersContext(t, nil)
+	crossing := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil))
+	manager.MarkResult(crossing, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	internallogging.SetResponseHeaders(admittedBefore, http.Header{
+		"Anthropic-Ratelimit-Unified-Status":         {"allowed_warning"},
+		"Anthropic-Ratelimit-Unified-5h-Status":      {"allowed_warning"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":       {reset},
+		"Anthropic-Ratelimit-Unified-Overage-Status": {"allowed"},
+	})
+	manager.MarkResult(admittedBefore, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	if !refused() {
+		t.Fatal("a same-window response admitted before the crossing lifted the block")
 	}
 }

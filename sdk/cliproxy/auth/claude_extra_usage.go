@@ -162,7 +162,7 @@ func (m *Manager) watchClaudeResponseHeaders(ctx context.Context, attempt *Auth,
 }
 
 func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model, routeModel string, headers http.Header, arrival uint64) {
-	if len(headers) == 0 {
+	if len(collectQuotaSignals("claude", headers)) == 0 {
 		return
 	}
 	m.mu.Lock()
@@ -172,9 +172,9 @@ func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model,
 	if auth == nil || isStaleExecutionResult(identity, auth) {
 		return
 	}
-	auth.Quota.observeResultHeaders(provider, headers, arrival, now)
+	auth.Quota.observeResultHeaders(provider, headers, arrival, now, true)
 	if state := ensureModelState(auth, m.claudeObservationModelKeyLocked(auth, model, routeModel)); state != nil {
-		state.Quota.observeResultHeaders(provider, headers, arrival, now)
+		state.Quota.observeResultHeaders(provider, headers, arrival, now, false)
 	}
 }
 
@@ -191,6 +191,46 @@ func (m *Manager) claudeObservationModelKeyLocked(auth *Auth, model, routeModel 
 		return ""
 	}
 	return m.resolveMarkResultModelKeyLocked(auth, modelKey, routeModel)
+}
+
+// keepClaudeExtraUsageSnapshot reports whether current, a snapshot that shows
+// extra usage still in effect, must survive incoming headers that do not. The
+// headers of a response are fixed when Anthropic admits the request, so a
+// response admitted just before the limit was crossed can arrive after the one
+// that crossed it. Such a response describes the same plan window; only a window
+// that has rolled over to a later reset proves the block is over. The block also
+// ends on its own once its reset passes.
+func keepClaudeExtraUsageSnapshot(current map[string]string, incoming http.Header, credentialLevel bool, now time.Time) bool {
+	if _, blocked := claudeExtraUsageResetAt(current, credentialLevel, now); !blocked {
+		return false
+	}
+	incomingSignals := collectQuotaSignals("claude", incoming)
+	if len(incomingSignals) == 0 {
+		return false
+	}
+	if _, inExtraUsage := claudeExtraUsageResetAt(incomingSignals, false, now); inExtraUsage {
+		return false
+	}
+	currentHeaders := make(http.Header, len(current))
+	for key, value := range current {
+		currentHeaders.Set(key, value)
+	}
+	incomingHeaders := make(http.Header, len(incomingSignals))
+	for key, value := range incomingSignals {
+		incomingHeaders.Set(key, value)
+	}
+	for _, window := range rejectedClaudeUnifiedWindows(currentHeaders) {
+		if credentialLevel && window != "5h" && window != "7d" {
+			continue
+		}
+		resetHeader := claudeUnifiedWindowHeader(window, "Reset")
+		currentReset, okCurrent := parseClaudeResetEpoch(currentHeaders.Get(resetHeader))
+		incomingReset, okIncoming := parseClaudeResetEpoch(incomingHeaders.Get(resetHeader))
+		if okCurrent && okIncoming && incomingReset.After(currentReset) {
+			return false
+		}
+	}
+	return true
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's
