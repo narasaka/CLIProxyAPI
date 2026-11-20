@@ -1926,6 +1926,23 @@ func (m *Manager) homeRetryAllowed(attempt int, retryLimit int) bool {
 	return attempt < retryLimit
 }
 
+func homeRetryLimitValue(retryLimit *int) int {
+	if retryLimit == nil {
+		return -1
+	}
+	return *retryLimit
+}
+
+// restoreHomeRetryLimitAfterRefusal undoes a refused credential's own retry
+// override: it never served the request, so it must not extend the retry budget.
+// A request_retry sent by Home stays authoritative.
+func restoreHomeRetryLimitAfterRefusal(retryLimit *int, before int, selection *HomeDispatchSelection) {
+	if retryLimit == nil || (selection != nil && selection.hasRequestRetry) {
+		return
+	}
+	*retryLimit = before
+}
+
 func (m *Manager) observeHomeRetryLimit(auth *Auth, selection *HomeDispatchSelection, retryLimit *int) {
 	if m == nil || retryLimit == nil {
 		return

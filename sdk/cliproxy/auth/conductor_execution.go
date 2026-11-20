@@ -1802,6 +1802,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		retryLimitBeforeAuth := homeRetryLimitValue(homeRetryLimit)
 		if homeMode {
 			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
 		}
@@ -2052,6 +2053,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			if isCredentialTerminatedError(errStream) {
 				recordRequestRefusedAuth(ctx, auth.ID)
+				if homeMode {
+					restoreHomeRetryLimitAfterRefusal(homeRetryLimit, retryLimitBeforeAuth, selection)
+				}
 				if selection != nil {
 					homeExcludedAuthIDs[auth.ID] = struct{}{}
 					lastHomeAuthID = auth.ID

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -106,6 +108,33 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (cred
 	credential, model = maps.Clone(credentialQuota.Signals), maps.Clone(modelQuota.Signals)
 	m.mu.RUnlock()
 	return credential, model
+}
+
+// observeClaudeStreamHeaders records a started Claude stream's rate-limit headers
+// right away. The stream's result is recorded only when it ends, so otherwise a
+// response showing the plan limit used up would not block new requests for as
+// long as that stream runs. Arrival ordering keeps the later result from
+// replacing anything newer.
+func (m *Manager) observeClaudeStreamHeaders(ctx context.Context, authID, provider, model string) {
+	if m == nil || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		return
+	}
+	headers := internallogging.GetResponseHeaders(ctx)
+	if len(headers) == 0 {
+		return
+	}
+	arrival := internallogging.GetResponseHeadersArrival(ctx)
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[authID]
+	if auth == nil {
+		return
+	}
+	auth.Quota.observeResultHeaders(provider, headers, arrival, now)
+	if state := existingModelState(auth, model); state != nil {
+		state.Quota.observeResultHeaders(provider, headers, arrival, now)
+	}
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's

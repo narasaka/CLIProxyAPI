@@ -562,8 +562,9 @@ upstream:
     #          credential can serve the request, clients get a 429 with Retry-After,
     #          like a plan without extra usage.
     # The block is decided per request from the credential's latest rate-limit
-    # headers, so the request that first goes over the limit is still billed, and
-    # switching back to allow takes effect on the next request. Hot-reloadable.
+    # headers, so the request that first goes over the limit, and any requests
+    # already sent when its response arrives, are still billed. Switching back to
+    # allow takes effect on the next request. Hot-reloadable.
     # Override per credential with "extra_usage": "allow" or "block" in its auth file.
     extra-usage: allow
 

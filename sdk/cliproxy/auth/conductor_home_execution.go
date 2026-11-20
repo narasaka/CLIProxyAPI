@@ -214,6 +214,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			selection.End("missing_execution_target")
 			return cliproxyexecutor.Response{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		retryLimitBeforeAuth := homeRetryLimitValue(homeRetryLimit)
 		m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
 		if _, seen := tried[auth.ID]; seen {
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "repeated_auth"); errEnd != nil {
@@ -472,6 +473,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		}
 		if refusedErr != nil {
 			recordRequestRefusedAuth(ctx, auth.ID)
+			restoreHomeRetryLimitAfterRefusal(homeRetryLimit, retryLimitBeforeAuth, selection)
 			lastErr = keepEarlierCredentialRefusal(lastErr, refusedErr)
 			releaseAttempt()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "credential_refused"); errEnd != nil {

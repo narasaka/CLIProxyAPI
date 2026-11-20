@@ -805,6 +805,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
+		if !ephemeralResult {
+			m.observeClaudeStreamHeaders(ctx, auth.ID, provider, resultModel)
+		}
 		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, routeModel, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult, execOpts, executionSeq), nil
 	}
 	if lastErr == nil {
