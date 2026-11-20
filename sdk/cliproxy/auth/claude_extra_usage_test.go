@@ -50,26 +50,26 @@ func TestClaudeExtraUsageResetAt(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	at := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
 	tests := []struct {
-		name       string
-		overrides  map[string]string
-		sharedOnly bool
-		want       time.Duration
-		blocked    bool
+		name            string
+		overrides       map[string]string
+		credentialLevel bool
+		want            time.Duration
+		blocked         bool
 	}{
-		{name: "plan limit used up with overage allowed", sharedOnly: true, want: 2 * time.Hour, blocked: true},
-		{name: "overage allowed_warning", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": "allowed_warning"}, sharedOnly: true, want: 2 * time.Hour, blocked: true},
-		{name: "overage rejected is a real upstream 429", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": "rejected"}, sharedOnly: true},
-		{name: "overage status missing", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": ""}, sharedOnly: true},
-		{name: "plan limit not used up", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-5h-Status": "allowed_warning"}, sharedOnly: true},
-		{name: "reset already passed", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": at(-time.Minute), "Anthropic-Ratelimit-Unified-5h-Reset": at(-time.Minute)}, sharedOnly: true},
-		{name: "no reset", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": "", "Anthropic-Ratelimit-Unified-5h-Reset": ""}, sharedOnly: true},
-		{name: "reset beyond any plan window", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": at(9 * 24 * time.Hour), "Anthropic-Ratelimit-Unified-5h-Reset": ""}, sharedOnly: true},
-		{name: "latest rejected window reset wins", overrides: map[string]string{"Anthropic-Ratelimit-Unified-7d-Status": "rejected", "Anthropic-Ratelimit-Unified-7d-Reset": at(30 * time.Hour)}, sharedOnly: true, want: 30 * time.Hour, blocked: true},
-		{name: "allowed window reset is ignored", overrides: map[string]string{"Anthropic-Ratelimit-Unified-7d-Status": "allowed", "Anthropic-Ratelimit-Unified-7d-Reset": at(30 * time.Hour)}, sharedOnly: true, want: 2 * time.Hour, blocked: true},
+		{name: "plan limit used up with overage allowed", credentialLevel: true, want: 2 * time.Hour, blocked: true},
+		{name: "overage allowed_warning", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": "allowed_warning"}, credentialLevel: true, want: 2 * time.Hour, blocked: true},
+		{name: "overage rejected is a real upstream 429", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": "rejected"}, credentialLevel: true},
+		{name: "overage status missing", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Overage-Status": ""}, credentialLevel: true},
+		{name: "plan limit not used up", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed_warning", "Anthropic-Ratelimit-Unified-5h-Status": "allowed_warning"}, credentialLevel: true},
+		{name: "reset already passed", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": at(-time.Minute), "Anthropic-Ratelimit-Unified-5h-Reset": at(-time.Minute)}, credentialLevel: true},
+		{name: "no reset", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": "", "Anthropic-Ratelimit-Unified-5h-Reset": ""}, credentialLevel: true},
+		{name: "reset beyond any plan window", overrides: map[string]string{"Anthropic-Ratelimit-Unified-Reset": at(9 * 24 * time.Hour), "Anthropic-Ratelimit-Unified-5h-Reset": ""}, credentialLevel: true},
+		{name: "latest rejected window reset wins", overrides: map[string]string{"Anthropic-Ratelimit-Unified-7d-Status": "rejected", "Anthropic-Ratelimit-Unified-7d-Reset": at(30 * time.Hour)}, credentialLevel: true, want: 30 * time.Hour, blocked: true},
+		{name: "allowed window reset is ignored", overrides: map[string]string{"Anthropic-Ratelimit-Unified-7d-Status": "allowed", "Anthropic-Ratelimit-Unified-7d-Reset": at(30 * time.Hour)}, credentialLevel: true, want: 2 * time.Hour, blocked: true},
 		{
-			name:       "per-model weekly claim does not block the whole credential",
-			overrides:  map[string]string{"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus", "Anthropic-Ratelimit-Unified-5h-Status": "allowed"},
-			sharedOnly: true,
+			name:            "per-model weekly claim does not block the whole credential",
+			overrides:       map[string]string{"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus", "Anthropic-Ratelimit-Unified-5h-Status": "allowed"},
+			credentialLevel: true,
 		},
 		{
 			name: "shared deadline ignores a per-model weekly reset",
@@ -80,9 +80,9 @@ func TestClaudeExtraUsageResetAt(t *testing.T) {
 				"Anthropic-Ratelimit-Unified-7d_opus-Status":       "rejected",
 				"Anthropic-Ratelimit-Unified-7d_opus-Reset":        at(6 * 24 * time.Hour),
 			},
-			sharedOnly: true,
-			want:       time.Hour,
-			blocked:    true,
+			credentialLevel: true,
+			want:            time.Hour,
+			blocked:         true,
 		},
 		{
 			name: "model deadline keeps the per-model weekly reset",
@@ -103,7 +103,7 @@ func TestClaudeExtraUsageResetAt(t *testing.T) {
 				"Anthropic-Ratelimit-Unified-Reset":                at(6 * 24 * time.Hour),
 				"Anthropic-Ratelimit-Unified-5h-Reset":             at(-time.Minute),
 			},
-			sharedOnly: true,
+			credentialLevel: true,
 		},
 		{
 			name:      "per-model weekly claim blocks that model",
@@ -114,7 +114,7 @@ func TestClaudeExtraUsageResetAt(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resetAt, blocked := claudeExtraUsageResetAt(claudeExtraUsageSignals(now, tt.overrides), tt.sharedOnly, now)
+			resetAt, blocked := claudeExtraUsageResetAt(claudeExtraUsageSignals(now, tt.overrides), tt.credentialLevel, now)
 			if blocked != tt.blocked {
 				t.Fatalf("blocked = %v, want %v", blocked, tt.blocked)
 			}
@@ -1609,5 +1609,26 @@ func TestClaudeExtraUsageShorterStaleBlockDoesNotShortenLongerOne(t *testing.T) 
 	var refusal *credentialTerminatedError
 	if !errors.As(manager.claudeExtraUsageRefusal(auth, model, model, now), &refusal) || refusal.recoverAt.Sub(now) < 119*time.Hour {
 		t.Fatalf("refusal = %+v, want the five-day block kept", refusal)
+	}
+}
+
+func TestClaudeExtraUsageLaterWindowFromAnotherModelLiftsSharedBlock(t *testing.T) {
+	const modelX, modelY = "claude-extra-usage-lift-x", "claude-extra-usage-lift-y"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, modelX, "block", nil)
+	record := func(model string, signals map[string]string) {
+		manager.MarkResult(claudeHeadersContext(t, signals), Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	}
+	// Model X's response shows the shared 5h window used up.
+	record(modelX, claudeExtraUsageSignals(now, nil))
+	// Model Y's response comes from the next 5h window.
+	record(modelY, map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":    "allowed",
+		"Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+		"Anthropic-Ratelimit-Unified-5h-Reset":  strconv.FormatInt(now.Add(7*time.Hour).Unix(), 10),
+	})
+	auth, _ := manager.GetByID("cred-a")
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, modelX, modelX, time.Now()); errRefuse != nil {
+		t.Fatalf("model X kept a shared block after the window rolled over: %v", errRefuse)
 	}
 }

@@ -119,7 +119,7 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel, routeModel str
 	signals := credentialSignals
 	resetAt, blocked := claudeExtraUsageResetAt(credentialSignals, true, now)
 	// The requested model may also be blocked by its own weekly window, which can
-	// outlast the shared one. The later deadline is the real one.
+	// outlast the shared ones. The later deadline is the real one.
 	if modelResetAt, modelBlocked := claudeExtraUsageResetAt(modelSignals, false, now); modelBlocked && modelResetAt.After(resetAt) {
 		signals, resetAt, blocked = modelSignals, modelResetAt, true
 	}
@@ -223,13 +223,15 @@ func (m *Manager) claudeObservationModelKeyLocked(auth *Auth, model, routeModel 
 	return m.resolveMarkResultModelKeyLocked(auth, modelKey, routeModel)
 }
 
-// keepClaudeExtraUsageSnapshot reports whether current, a snapshot that shows
-// extra usage still in effect, must survive incoming headers that do not. The
-// headers of a response are fixed when Anthropic admits the request, so a
+// keepClaudeExtraUsageSnapshot reports whether current, a snapshot whose windows
+// at this level show extra usage still in effect, must survive incoming headers.
+// The headers of a response are fixed when Anthropic admits the request, so a
 // response admitted just before the limit was crossed can arrive after the one
 // that crossed it. Such a response describes the same plan window; only a window
-// that has rolled over to a later reset proves the block is over. The block also
-// ends on its own once its reset passes.
+// that has rolled over to a later reset proves the block is over. Incoming
+// headers that show extra usage at this level replace the snapshot unless they
+// would shorten its deadline. The block also ends on its own once its reset
+// passes.
 func keepClaudeExtraUsageSnapshot(current map[string]string, incoming http.Header, credentialLevel bool, now time.Time) bool {
 	currentDeadline, blocked := claudeExtraUsageResetAt(current, credentialLevel, now)
 	if !blocked {
@@ -263,7 +265,7 @@ func keepClaudeExtraUsageSnapshot(current map[string]string, incoming http.Heade
 // blocks current already started over, which proves the block is over.
 func claudeBlockingWindowRolledOver(current, incoming http.Header, credentialLevel bool) bool {
 	for _, window := range rejectedClaudeUnifiedWindows(current) {
-		if credentialLevel && window != "5h" && window != "7d" {
+		if (window == "5h" || window == "7d") != credentialLevel {
 			continue
 		}
 		if claudeResetRolledOver(current, incoming, claudeUnifiedWindowHeader(window, "Reset")) {
@@ -273,7 +275,7 @@ func claudeBlockingWindowRolledOver(current, incoming http.Header, credentialLev
 	// A block known only from the unified headers rolls over when a response for
 	// the same representative claim reports a later unified reset.
 	claim := strings.ToLower(strings.TrimSpace(current.Get("Anthropic-Ratelimit-Unified-Representative-Claim")))
-	return claim != "" && !(credentialLevel && strings.HasPrefix(claim, "seven_day_")) &&
+	return claim != "" && strings.HasPrefix(claim, "seven_day_") != credentialLevel &&
 		strings.EqualFold(strings.TrimSpace(incoming.Get("Anthropic-Ratelimit-Unified-Representative-Claim")), claim) &&
 		claudeResetRolledOver(current, incoming, "Anthropic-Ratelimit-Unified-Reset")
 }
@@ -291,14 +293,15 @@ func claudeResetRolledOver(current, incoming http.Header, resetHeader string) bo
 // plan limit behind it resets. This is the response shape Claude Code reports as
 // "using extra usage": unified status rejected while overage is allowed.
 //
-// sharedOnly limits the match to the plan-wide 5h and 7d windows. A per-model
-// weekly window (a seven_day_* claim) only bills that model as extra usage, so the
-// credential-level snapshot, which reflects whichever model ran last, must not
-// block every other model on it, nor for longer than the shared windows last.
+// credentialLevel selects which windows count. The credential-level snapshot
+// decides the plan-wide 5h and 7d windows, which every model shares. A model's
+// snapshot decides only that model's own windows (a seven_day_* claim), which
+// bill only that model as extra usage. Keeping the levels disjoint means a
+// model's copy of a shared window can never outlive the credential's view of it.
 //
 // Without a future reset no block applies: blocked credentials receive no traffic,
 // so an open-ended block would never see the response that lifts it.
-func claudeExtraUsageResetAt(signals map[string]string, sharedOnly bool, now time.Time) (time.Time, bool) {
+func claudeExtraUsageResetAt(signals map[string]string, credentialLevel bool, now time.Time) (time.Time, bool) {
 	if len(signals) == 0 {
 		return time.Time{}, false
 	}
@@ -319,14 +322,14 @@ func claudeExtraUsageResetAt(signals map[string]string, sharedOnly bool, now tim
 		shared := window == "5h" || window == "7d"
 		sharedWindowRejected = sharedWindowRejected || shared
 		modelWindowRejected = modelWindowRejected || !shared
-		if !sharedOnly || shared {
+		if shared == credentialLevel {
 			resetHeaders = append(resetHeaders, claudeUnifiedWindowHeader(window, "Reset"))
 		}
 	}
 	// The unified reset belongs to the representative claim. Without a claim it is
 	// shared unless the only rejected windows are per-model ones.
 	unifiedShared := !strings.HasPrefix(claim, "seven_day_") && (claim != "" || sharedWindowRejected || !modelWindowRejected)
-	if !sharedOnly || unifiedShared {
+	if unifiedShared == credentialLevel {
 		resetHeaders = append(resetHeaders, "Anthropic-Ratelimit-Unified-Reset")
 	}
 	var latest time.Time
