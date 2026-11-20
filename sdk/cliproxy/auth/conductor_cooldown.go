@@ -2133,8 +2133,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 						auth.NextRetryAfter = authOwnRetry
 						auth.Quota = QuotaState{
-							ObservedAt: savedModelAggQuota.ObservedAt,
-							Signals:    maps.Clone(savedModelAggQuota.Signals),
+							ObservedAt:  savedModelAggQuota.ObservedAt,
+							Signals:     maps.Clone(savedModelAggQuota.Signals),
+							observedSeq: savedModelAggQuota.observedSeq,
 						}
 					}
 					prevAuthQuotaActive := auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now)

@@ -613,3 +613,117 @@ func TestClaudeExtraUsageStaleStreamCompletionKeepsBlock(t *testing.T) {
 		t.Fatal("a newer allowed response did not lift the block")
 	}
 }
+
+func TestClaudeExtraUsageBlockAppliesToInferenceVerification(t *testing.T) {
+	const model = "claude-extra-usage-verify"
+	manager, executor, _ := newClaudeExtraUsageTestManager(t, model, "block", map[string]map[string]string{
+		"cred-a": claudeExtraUsageSignals(time.Now(), nil),
+	})
+	_, errVerify := manager.VerifyInference(t.Context(), "cred-a", model)
+	var cooldown *modelCooldownError
+	if !errors.As(errVerify, &cooldown) || cooldown == nil || cooldown.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("VerifyInference error = %v (%T), want a 429 cooldown", errVerify, errVerify)
+	}
+	if len(executor.Calls()) != 0 {
+		t.Fatalf("executor calls = %v, want none", executor.Calls())
+	}
+	// An unblocked credential still reaches the upstream.
+	_, _ = manager.VerifyInference(t.Context(), "cred-b", model)
+	if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
+		t.Fatalf("executor calls = %v, want [cred-b]", calls)
+	}
+}
+
+func TestClaudeExtraUsageCredentialFailureKeepsSnapshotOrder(t *testing.T) {
+	const model = "claude-extra-usage-isolated"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	mark := func(executionSeq uint64, signals map[string]string, result Result) {
+		ctx := WithSkipPersist(t.Context())
+		if signals != nil {
+			ctx = internallogging.WithResponseHeadersHolder(ctx)
+			headers := http.Header{}
+			for key, value := range signals {
+				headers.Set(key, value)
+			}
+			internallogging.SetResponseHeaders(ctx, headers)
+		}
+		result.AuthID, result.Provider, result.ExecutionSeq = "cred-a", "claude", executionSeq
+		manager.MarkResult(ctx, result)
+	}
+
+	mark(3, claudeExtraUsageSignals(now, nil), Result{Model: model, RouteModel: model, Success: true})
+	// A delayed credential-level failure without model fields rebuilds the credential quota.
+	mark(2, nil, Result{CredentialScope: true, Error: &Error{Code: "unavailable", Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable}})
+	// An older stream then finishes with headers from before the limit was crossed.
+	mark(1, map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"}, Result{Model: model, RouteModel: model, Success: true})
+
+	auth, _ := manager.GetByID("cred-a")
+	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-extra-usage-other-model", time.Now()); errRefuse == nil {
+		t.Fatalf("shared block lifted by a stale completion after a credential-level failure; signals = %v", auth.Quota.Signals)
+	}
+}
+
+// claudeHeaderTestExecutor answers like afterAuthTestExecutor and reports the
+// rate-limit headers configured for the requested model.
+type claudeHeaderTestExecutor struct {
+	*afterAuthTestExecutor
+	headersByModel map[string]map[string]string
+}
+
+func (e *claudeHeaderTestExecutor) setHeaders(ctx context.Context, model string) {
+	headers := http.Header{}
+	for key, value := range e.headersByModel[model] {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
+}
+
+func (e *claudeHeaderTestExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.setHeaders(ctx, req.Model)
+	return e.afterAuthTestExecutor.Execute(ctx, auth, req, opts)
+}
+
+func (e *claudeHeaderTestExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.setHeaders(ctx, req.Model)
+	return e.afterAuthTestExecutor.ExecuteStream(ctx, auth, req, opts)
+}
+
+func TestClaudeExtraUsageBlockAppliesToOtherModelsOnTheCredential(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			sonnet, opus := "claude-extra-usage-sonnet-"+mode, "claude-extra-usage-opus-"+mode
+			now := time.Now()
+			executor := &claudeHeaderTestExecutor{
+				afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"},
+				headersByModel: map[string]map[string]string{
+					opus:   {"Anthropic-Ratelimit-Unified-Status": "allowed", "Anthropic-Ratelimit-Unified-5h-Status": "allowed"},
+					sonnet: claudeExtraUsageSignals(now, nil),
+				},
+			}
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+			manager.SetRetryConfig(2, 0, 5)
+			manager.RegisterExecutor(executor)
+			for _, id := range []string{"cred-a", "cred-b"} {
+				registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: sonnet}, {ID: opus}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+				if _, errReg := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: id, Provider: "claude", Status: StatusActive}); errReg != nil {
+					t.Fatal(errReg)
+				}
+			}
+
+			for _, model := range []string{opus, sonnet} {
+				if payload, errInvoke := invokeAfterAuthMode(manager, "claude", model, mode, cliproxyexecutor.Options{}); errInvoke != nil || string(payload) != "ok:cred-a" {
+					t.Fatalf("%s: payload = %q, error = %v, want ok:cred-a", model, payload, errInvoke)
+				}
+			}
+			// Sonnet's response showed cred-a's shared plan limit used up, so Opus must
+			// move to cred-b even though Opus's own last response on cred-a was allowed.
+			payload, errInvoke := invokeAfterAuthMode(manager, "claude", opus, mode, cliproxyexecutor.Options{})
+			if errInvoke != nil || string(payload) != "ok:cred-b" {
+				t.Fatalf("opus after the limit: payload = %q, error = %v, want ok:cred-b", payload, errInvoke)
+			}
+		})
+	}
+}

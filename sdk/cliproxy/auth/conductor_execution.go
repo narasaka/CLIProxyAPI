@@ -3399,6 +3399,10 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	if stateModel == "" {
 		stateModel = canonicalModelKey(routeModel)
 	}
+	// Verification is a real, billed request, so it honors claude.extra-usage too.
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+		return auth, unwrapExecutionBoundaryError(errRefuse)
+	}
 
 	sessionID := fmt.Sprintf("verify-%s-%d", auth.ID, time.Now().UTC().UnixNano())
 	// Codex upstreams reject integer max_output_tokens below 16, so the minimal

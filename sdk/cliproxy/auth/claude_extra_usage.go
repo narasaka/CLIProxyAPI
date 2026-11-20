@@ -64,14 +64,13 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 	if auth == nil || executorKeyFromAuth(auth) != "claude" || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
 		return nil
 	}
-	signals := auth.Quota.Signals
-	resetAt, blocked := claudeExtraUsageResetAt(signals, true, now)
+	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel)
+	signals := credentialSignals
+	resetAt, blocked := claudeExtraUsageResetAt(credentialSignals, true, now)
 	// The requested model may also be blocked by its own weekly window, which can
 	// outlast the shared one. The later deadline is the real one.
-	if state := existingModelState(auth, stateModel); state != nil {
-		if modelResetAt, modelBlocked := claudeExtraUsageResetAt(state.Quota.Signals, false, now); modelBlocked && modelResetAt.After(resetAt) {
-			signals, resetAt, blocked = state.Quota.Signals, modelResetAt, true
-		}
+	if modelResetAt, modelBlocked := claudeExtraUsageResetAt(modelSignals, false, now); modelBlocked && modelResetAt.After(resetAt) {
+		signals, resetAt, blocked = modelSignals, modelResetAt, true
 	}
 	if !blocked {
 		return nil
@@ -83,6 +82,30 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 	}).Debug("claude extra-usage blocked: skipping credential whose plan limit is used up")
 	cooldown := newModelCooldownErrorForCandidates(stateModel, "claude", resetAt.Sub(now), errClaudeExtraUsageBlocked, true, claudeExtraUsageRefusalSignals(signals))
 	return &credentialTerminatedError{terminal: cooldown, recoverAt: resetAt}
+}
+
+// claudeExtraUsageSnapshots returns the newest credential-level and model-level
+// rate-limit snapshots for auth. The picked auth can be a per-model scheduler copy
+// that missed responses for other models on the same credential, so the manager's
+// live auth is consulted too; a Home-dispatched auth may exist only as the copy.
+func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (credential, model map[string]string) {
+	credentialQuota := auth.Quota
+	var modelQuota QuotaState
+	if state := existingModelState(auth, stateModel); state != nil {
+		modelQuota = state.Quota
+	}
+	m.mu.RLock()
+	if live := m.auths[auth.ID]; live != nil {
+		if live.Quota.ObservedAt.After(credentialQuota.ObservedAt) {
+			credentialQuota = live.Quota
+		}
+		if state := existingModelState(live, stateModel); state != nil && state.Quota.ObservedAt.After(modelQuota.ObservedAt) {
+			modelQuota = state.Quota
+		}
+	}
+	credential, model = maps.Clone(credentialQuota.Signals), maps.Clone(modelQuota.Signals)
+	m.mu.RUnlock()
+	return credential, model
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's
