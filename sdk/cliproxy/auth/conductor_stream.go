@@ -557,6 +557,21 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		executionSeq := m.nextExecutionSeq()
 		accessToken := authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 		startStream := time.Now()
+		upstreamBeforeAttempt := upstreamErr
+		// refuseAfterRefresh honors a block recorded while the token was refreshed:
+		// the refreshed resend would be a new billed request.
+		refuseAfterRefresh := func() error {
+			errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, time.Now())
+			if errRefuse == nil {
+				return nil
+			}
+			upstreamErr = upstreamBeforeAttempt
+			recordRequestRefusedAuth(ctx, auth.ID)
+			if upstreamErr != nil {
+				return preferredExecutionAttemptError(lastErr, upstreamErr)
+			}
+			return errRefuse
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -575,6 +590,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					auth = refreshed
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					if errRefuse := refuseAfterRefresh(); errRefuse != nil {
+						return nil, errRefuse
+					}
 					ctx = m.newUpstreamAttemptContext(ctx)
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
@@ -642,6 +660,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
+		// Headers are in hand once the stream is open; the first payload can lag.
+		if !ephemeralResult {
+			m.observeClaudeStreamHeaders(ctx, auth, accessToken, provider, resultModel)
+		}
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		bootstrapErr = markUpstreamExecutionAttemptFromContext(ctx, bootstrapErr)
 		if hasUpstreamExecutionAttempt(bootstrapErr) {
@@ -661,6 +683,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					auth = refreshed
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					if errRefuse := refuseAfterRefresh(); errRefuse != nil {
+						return nil, errRefuse
+					}
 					ctx = m.newUpstreamAttemptContext(ctx)
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()

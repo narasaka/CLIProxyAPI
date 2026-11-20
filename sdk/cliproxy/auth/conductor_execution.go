@@ -1318,6 +1318,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = withUpstreamAttemptProvider(syncMetadataSessionToContext(execCtx, execOpts.Metadata), provider)
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
+			upstreamBeforeAttempt := upstreamErr
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -1336,6 +1337,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					didRefreshOnUnauthorized = true
 					execCtx = withUpstreamAttemptProvider(m.newUpstreamAttemptContext(execCtx), provider)
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+					// The refreshed token resolves the 401, but resending is a new billed
+					// request, so it honors a block recorded in the meantime.
+					if errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, time.Now()); errRefuse != nil {
+						upstreamErr = upstreamBeforeAttempt
+						recordRequestRefusedAuth(ctx, auth.ID)
+						authErr = errRefuse
+						break
+					}
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)

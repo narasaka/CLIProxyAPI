@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -892,5 +893,183 @@ func TestClaudeExtraUsageStreamFromReplacedCredentialIsIgnored(t *testing.T) {
 	current, _ := manager.GetByID("cred-a")
 	if errRefuse := manager.claudeExtraUsageRefusal(current, model, time.Now()); errRefuse != nil {
 		t.Fatalf("old credential's stream blocked its replacement: %v", errRefuse)
+	}
+}
+
+// claudeDelayedPayloadExecutor opens streams whose rate-limit headers arrive at
+// once while the first payload is held until release is closed.
+type claudeDelayedPayloadExecutor struct {
+	*afterAuthTestExecutor
+	release chan struct{}
+}
+
+func (e *claudeDelayedPayloadExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.record(auth)
+	headers := http.Header{}
+	for key, value := range claudeExtraUsageSignals(time.Now(), nil) {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	go func() {
+		<-e.release
+		chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok:" + auth.ID)}
+		close(chunks)
+	}()
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestClaudeExtraUsageBlockAppliesBeforeTheFirstStreamPayload(t *testing.T) {
+	const model = "claude-extra-usage-delayed-payload"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	executor := &claudeDelayedPayloadExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, release: make(chan struct{})}
+	manager.RegisterExecutor(executor)
+
+	streamDone := make(chan error, 1)
+	go func() {
+		stream, errStream := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+		if errStream == nil {
+			for range stream.Chunks {
+			}
+		}
+		streamDone <- errStream
+	}()
+
+	// The block must become visible while the first payload is still held back.
+	deadline := time.After(5 * time.Second)
+	for {
+		auth, _ := manager.GetByID("cred-a")
+		if auth != nil && len(executor.Calls()) == 1 && manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil {
+			break
+		}
+		select {
+		case <-deadline:
+			close(executor.release)
+			t.Fatal("block not recorded before the stream's first payload")
+		default:
+			runtime.Gosched()
+		}
+	}
+	payload, errExec := invokeAfterAuthMode(manager, "claude", model, "execute", cliproxyexecutor.Options{})
+	close(executor.release)
+	if errStream := <-streamDone; errStream != nil {
+		t.Fatalf("crossing stream error = %v", errStream)
+	}
+	if errExec != nil || string(payload) != "ok:cred-b" {
+		t.Fatalf("request before the first payload: payload = %q, error = %v, want ok:cred-b", payload, errExec)
+	}
+}
+
+// claudeRefreshRaceExecutor answers cred-a's first request with a 401 after a
+// concurrent response has recorded that cred-a is in extra usage.
+type claudeRefreshRaceExecutor struct {
+	*afterAuthTestExecutor
+	manager   *Manager
+	t         *testing.T
+	model     string
+	bootstrap bool
+}
+
+func (e *claudeRefreshRaceExecutor) failFirst(auth *Auth) bool {
+	if auth.ID != "cred-a" || len(e.Calls()) != 0 {
+		return false
+	}
+	e.record(auth)
+	e.manager.MarkResult(claudeHeadersContext(e.t, claudeExtraUsageSignals(time.Now(), nil)), Result{
+		AuthID: auth.ID, Provider: "claude", Model: e.model, RouteModel: e.model, Success: true,
+		AccessToken: authAccessToken(auth), RegistrationEpoch: auth.RegistrationEpoch, CredentialVersion: auth.CredentialVersion,
+	})
+	return true
+}
+
+func (e *claudeRefreshRaceExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if e.failFirst(auth) {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired token"}
+	}
+	return e.afterAuthTestExecutor.Execute(ctx, auth, req, opts)
+}
+
+func (e *claudeRefreshRaceExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if e.failFirst(auth) {
+		cliproxyexecutor.MarkUpstreamAttempt(ctx)
+		unauthorized := &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired token"}
+		if !e.bootstrap {
+			return nil, unauthorized
+		}
+		chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+		chunks <- cliproxyexecutor.StreamChunk{Err: unauthorized}
+		close(chunks)
+		return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+	}
+	return e.afterAuthTestExecutor.ExecuteStream(ctx, auth, req, opts)
+}
+
+func (e *claudeRefreshRaceExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	refreshed := auth.Clone()
+	refreshed.Metadata["access_token"] = "new-token"
+	return refreshed, nil
+}
+
+func TestClaudeExtraUsageRefreshRetryHonorsBlock(t *testing.T) {
+	for _, mode := range []string{"execute", "stream", "stream-bootstrap"} {
+		t.Run(mode, func(t *testing.T) {
+			model := "claude-extra-usage-refresh-" + mode
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+			manager.SetRetryConfig(0, 0, 0)
+			executor := &claudeRefreshRaceExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, manager: manager, t: t, model: model, bootstrap: mode == "stream-bootstrap"}
+			manager.RegisterExecutor(executor)
+			for _, id := range []string{"cred-a", "cred-b"} {
+				registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+				auth := &Auth{ID: id, Provider: "claude", Status: StatusActive, Metadata: map[string]any{"access_token": "old-token", "refresh_token": "refresh-token"}}
+				if _, errReg := manager.Register(WithSkipPersist(t.Context()), auth); errReg != nil {
+					t.Fatal(errReg)
+				}
+			}
+
+			invokeMode := mode
+			if mode == "stream-bootstrap" {
+				invokeMode = "stream"
+			}
+			payload, errInvoke := invokeAfterAuthMode(manager, "claude", model, invokeMode, cliproxyexecutor.Options{})
+			if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-a", "cred-b"}) {
+				t.Fatalf("executor calls = %v (payload %q, error %v), want the refreshed resend to skip blocked cred-a", calls, payload, errInvoke)
+			}
+			if errInvoke != nil || string(payload) != "ok:cred-b" {
+				t.Fatalf("payload = %q, error = %v, want ok:cred-b", payload, errInvoke)
+			}
+		})
+	}
+}
+
+func TestClaudeExtraUsageRefreshRetryRefusalReportsPlanLimit(t *testing.T) {
+	for _, mode := range []string{"execute", "stream", "stream-bootstrap"} {
+		t.Run(mode, func(t *testing.T) {
+			model := "claude-extra-usage-refresh-only-" + mode
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+			manager.SetRetryConfig(0, 0, 0)
+			executor := &claudeRefreshRaceExecutor{afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"}, manager: manager, t: t, model: model, bootstrap: mode == "stream-bootstrap"}
+			manager.RegisterExecutor(executor)
+			registry.GetGlobalRegistry().RegisterClient("cred-a", "claude", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("cred-a") })
+			auth := &Auth{ID: "cred-a", Provider: "claude", Status: StatusActive, Metadata: map[string]any{"access_token": "old-token", "refresh_token": "refresh-token"}}
+			if _, errReg := manager.Register(WithSkipPersist(t.Context()), auth); errReg != nil {
+				t.Fatal(errReg)
+			}
+
+			invokeMode := mode
+			if mode == "stream-bootstrap" {
+				invokeMode = "stream"
+			}
+			_, errInvoke := invokeAfterAuthMode(manager, "claude", model, invokeMode, cliproxyexecutor.Options{})
+			// The refresh resolved the 401, so the client must see the plan limit, not a sign-in failure.
+			var cooldown *modelCooldownError
+			if !errors.As(errInvoke, &cooldown) || cooldown == nil {
+				t.Fatalf("error = %v (%T), want the plan-limit 429", errInvoke, errInvoke)
+			}
+		})
 	}
 }
