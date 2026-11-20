@@ -1775,10 +1775,15 @@ func (m *Manager) retryAllowedForRequest(ctx context.Context, attempt int, provi
 	}
 
 	registryRef := registry.GetGlobalRegistry()
+	refused := requestRefusedAuthsFromContext(ctx)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		// A credential refused for this request cannot serve a later round either.
+		if _, isRefused := refused[auth.ID]; isRefused {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {

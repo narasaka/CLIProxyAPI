@@ -66,10 +66,11 @@ func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel string, now tim
 	}
 	signals := auth.Quota.Signals
 	resetAt, blocked := claudeExtraUsageResetAt(signals, true, now)
-	if !blocked {
-		if state := existingModelState(auth, stateModel); state != nil {
-			signals = state.Quota.Signals
-			resetAt, blocked = claudeExtraUsageResetAt(signals, false, now)
+	// The requested model may also be blocked by its own weekly window, which can
+	// outlast the shared one. The later deadline is the real one.
+	if state := existingModelState(auth, stateModel); state != nil {
+		if modelResetAt, modelBlocked := claudeExtraUsageResetAt(state.Quota.Signals, false, now); modelBlocked && modelResetAt.After(resetAt) {
+			signals, resetAt, blocked = state.Quota.Signals, modelResetAt, true
 		}
 	}
 	if !blocked {

@@ -214,7 +214,8 @@ func unwrapExecutionBoundaryError(err error) error {
 }
 
 func roundPickFailureError(lastErr, upstreamErr, errPick error) error {
-	if upstreamErr == nil && pickCooldownEndsBeforeRefusal(lastErr, errPick, time.Now()) {
+	var cooldown *modelCooldownError
+	if upstreamErr == nil && errors.As(errPick, &cooldown) && cooldown != nil && refusalOutlastsWait(lastErr, cooldown.resetIn, time.Now()) {
 		return errPick
 	}
 	preferred := preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -848,18 +849,16 @@ func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderEx
 	return applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
 }
 
-// pickCooldownEndsBeforeRefusal reports whether the candidates left after a refusal
-// are only cooling down and recover before the refused credential does. Returning
-// the cooldown then lets the normal retry wait serve the request instead of
+// refusalOutlastsWait reports whether lastErr is a refusal whose credential
+// recovers later than the remaining candidates' cooldown wait. Returning that
+// cooldown instead lets the normal retry wait serve the request rather than
 // reporting the refused credential's much later recovery.
-func pickCooldownEndsBeforeRefusal(lastErr, errPick error, now time.Time) bool {
+func refusalOutlastsWait(lastErr error, wait time.Duration, now time.Time) bool {
 	var refusal *credentialTerminatedError
-	var cooldown *modelCooldownError
-	if !errors.As(lastErr, &refusal) || refusal == nil || refusal.recoverAt.IsZero() ||
-		!errors.As(errPick, &cooldown) || cooldown == nil {
+	if !errors.As(lastErr, &refusal) || refusal == nil || refusal.recoverAt.IsZero() {
 		return false
 	}
-	return now.Add(cooldown.resetIn).Before(refusal.recoverAt)
+	return now.Add(wait).Before(refusal.recoverAt)
 }
 
 // keepEarlierCredentialRefusal returns next unless both errors are refusals with a
@@ -1775,6 +1774,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			var homeCooldown *homeDispatchRetryAfterError
 			if homeMode && lastErr != nil && errors.As(errPick, &homeCooldown) && homeCooldown != nil {
 				observeHomeCooldownRetryLimit(homeCooldown, homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == "")
+				if upstreamErr == nil && homeCooldown.retryAfter > 0 && refusalOutlastsWait(preferredErr, homeCooldown.retryAfter, time.Now()) {
+					return nil, markHomeRetryRoundExhausted(errPick, homeCooldown.RetryAfter(), false)
+				}
 				if isCredentialTerminatedError(preferredErr) {
 					return nil, preferredErr
 				}

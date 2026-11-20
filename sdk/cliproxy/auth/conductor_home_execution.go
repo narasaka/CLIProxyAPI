@@ -190,6 +190,9 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			var homeCooldown *homeDispatchRetryAfterError
 			if lastErr != nil && errors.As(errSelection, &homeCooldown) && homeCooldown != nil {
 				observeHomeCooldownRetryLimit(homeCooldown, homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == "")
+				if upstreamErr == nil && homeCooldown.retryAfter > 0 && refusalOutlastsWait(preferredErr, homeCooldown.retryAfter, time.Now()) {
+					return cliproxyexecutor.Response{}, markHomeRetryRoundExhausted(errSelection, homeCooldown.RetryAfter(), false)
+				}
 				if isCredentialTerminatedError(preferredErr) {
 					return cliproxyexecutor.Response{}, preferredErr
 				}

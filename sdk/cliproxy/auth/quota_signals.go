@@ -54,6 +54,20 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 	return true
 }
 
+// observeResultHeaders replaces the passive snapshot with a result's response
+// headers unless a later-dispatched execution already replaced it. A stream records
+// its result only when it ends, so without this ordering an older stream finishing
+// late would overwrite a newer snapshot with the headers it received at its start.
+// Results without an execution sequence keep the unordered behavior.
+func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, executionSeq uint64, observedAt time.Time) {
+	if q == nil || (executionSeq > 0 && executionSeq < q.observedSeq) {
+		return
+	}
+	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && executionSeq > 0 {
+		q.observedSeq = executionSeq
+	}
+}
+
 // ClearObservationSignals removes only passive observation data. It leaves
 // cooldown and scheduler state untouched.
 func (q *QuotaState) ClearObservationSignals() bool {
@@ -250,5 +264,6 @@ func mergeQuotaObservation(target, source QuotaState) QuotaState {
 	}
 	target.ObservedAt = source.ObservedAt
 	target.Signals = source.Clone().Signals
+	target.observedSeq = source.observedSeq
 	return target
 }
