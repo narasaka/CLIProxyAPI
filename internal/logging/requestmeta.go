@@ -32,7 +32,13 @@ type responseStatusHolder struct {
 type responseHeadersHolder struct {
 	mu      sync.RWMutex
 	headers http.Header
+	// arrival orders this holder's latest headers against every other holder's.
+	arrival uint64
 }
+
+// responseHeadersArrival is a process-wide counter stamped on each header update,
+// so consumers can tell which of several attempts received its headers last.
+var responseHeadersArrival atomic.Uint64
 
 func WithEndpoint(ctx context.Context, endpoint string) context.Context {
 	if ctx == nil {
@@ -123,6 +129,7 @@ func SetResponseHeaders(ctx context.Context, headers http.Header) {
 	holder.mu.Lock()
 	defer holder.mu.Unlock()
 	holder.headers = cloneHTTPHeader(headers)
+	holder.arrival = responseHeadersArrival.Add(1)
 }
 
 // MergeResponseHeaders adds headers observed after the initial HTTP response,
@@ -137,6 +144,7 @@ func MergeResponseHeaders(ctx context.Context, headers http.Header) {
 	}
 	holder.mu.Lock()
 	defer holder.mu.Unlock()
+	holder.arrival = responseHeadersArrival.Add(1)
 	if holder.headers == nil {
 		holder.headers = make(http.Header, len(headers))
 	}
@@ -171,6 +179,21 @@ func GetResponseHeaders(ctx context.Context) http.Header {
 	holder.mu.RLock()
 	defer holder.mu.RUnlock()
 	return cloneHTTPHeader(holder.headers)
+}
+
+// GetResponseHeadersArrival returns the arrival order of the headers stored in
+// ctx, or 0 when none were stored. A larger value means the headers arrived later.
+func GetResponseHeadersArrival(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
+	if !ok || holder == nil {
+		return 0
+	}
+	holder.mu.RLock()
+	defer holder.mu.RUnlock()
+	return holder.arrival
 }
 
 func cloneHTTPHeader(src http.Header) http.Header {

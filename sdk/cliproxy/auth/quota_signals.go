@@ -55,19 +55,19 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 }
 
 // observeResultHeaders replaces the passive snapshot with a result's response
-// headers unless a later-dispatched execution already replaced it. A Claude stream
+// headers unless headers that arrived later already replaced it. A Claude stream
 // records its result only when it ends, with the headers it received at its start,
-// so without this ordering an older stream finishing late would overwrite a newer
-// snapshot. Other providers can refresh quota headers mid-turn (Codex websocket
-// rate-limit frames), so for them the latest recorded result still wins, as do
-// results without an execution sequence.
-func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, executionSeq uint64, observedAt time.Time) {
-	ordered := executionSeq > 0 && strings.EqualFold(strings.TrimSpace(provider), "claude")
-	if q == nil || (ordered && executionSeq < q.observedSeq) {
+// and a request can reach the upstream after one dispatched later, so neither
+// recording nor dispatch order says which headers are newest; arrival order does.
+// Other providers keep the latest recorded result, as do results whose headers
+// carry no arrival order.
+func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time) {
+	ordered := arrival > 0 && strings.EqualFold(strings.TrimSpace(provider), "claude")
+	if q == nil || (ordered && arrival < q.observedSeq) {
 		return
 	}
 	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && ordered {
-		q.observedSeq = executionSeq
+		q.observedSeq = arrival
 	}
 }
 

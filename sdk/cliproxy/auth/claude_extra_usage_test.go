@@ -574,44 +574,56 @@ func TestRequestRefusedCredentialsDoNotAuthorizeRetryRounds(t *testing.T) {
 	}
 }
 
-func TestClaudeExtraUsageStaleStreamCompletionKeepsBlock(t *testing.T) {
-	const model = "claude-extra-usage-stale-stream"
+// claudeHeadersContext returns an attempt context whose response headers arrive
+// now, so tests can control arrival order independently of recording order.
+func claudeHeadersContext(t *testing.T, signals map[string]string) context.Context {
+	t.Helper()
+	ctx := internallogging.WithFreshResponseHeadersHolder(WithSkipPersist(t.Context()))
+	headers := http.Header{}
+	for key, value := range signals {
+		headers.Set(key, value)
+	}
+	internallogging.SetResponseHeaders(ctx, headers)
+	return ctx
+}
+
+func TestClaudeExtraUsageSnapshotsFollowHeaderArrival(t *testing.T) {
+	const model = "claude-extra-usage-arrival"
 	now := time.Now()
-	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
-	markWithHeaders := func(executionSeq uint64, signals map[string]string) {
-		ctx := internallogging.WithResponseHeadersHolder(WithSkipPersist(t.Context()))
-		headers := http.Header{}
-		for key, value := range signals {
-			headers.Set(key, value)
-		}
-		internallogging.SetResponseHeaders(ctx, headers)
+	allowed := map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed", "Anthropic-Ratelimit-Unified-5h-Status": "allowed"}
+	record := func(manager *Manager, ctx context.Context, executionSeq uint64) {
 		manager.MarkResult(ctx, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true, ExecutionSeq: executionSeq})
 	}
-	refused := func() bool {
+	refused := func(manager *Manager) bool {
 		auth, _ := manager.GetByID("cred-a")
 		return manager.claudeExtraUsageRefusal(auth, model, time.Now()) != nil
 	}
-	allowed := map[string]string{
-		"Anthropic-Ratelimit-Unified-Status":    "allowed",
-		"Anthropic-Ratelimit-Unified-5h-Status": "allowed",
-		"Anthropic-Ratelimit-Unified-Reset":     strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
-	}
 
-	// Request 2 crosses the plan limit and is recorded first.
-	markWithHeaders(2, claudeExtraUsageSignals(now, nil))
-	if !refused() {
-		t.Fatal("not refused after the response that crossed the limit")
-	}
-	// Stream 1, dispatched before the limit was crossed, ends later with its old headers.
-	markWithHeaders(1, allowed)
-	if !refused() {
-		t.Fatal("a stale stream completion lifted the block")
-	}
-	// A response dispatched after the block still replaces the snapshot.
-	markWithHeaders(3, allowed)
-	if refused() {
-		t.Fatal("a newer allowed response did not lift the block")
-	}
+	t.Run("stream that started before the crossing ends late", func(t *testing.T) {
+		manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+		streamCtx := claudeHeadersContext(t, allowed)                             // dispatched 1, headers first
+		crossingCtx := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil)) // dispatched 2, headers second
+		record(manager, crossingCtx, 2)
+		record(manager, streamCtx, 1)
+		if !refused(manager) {
+			t.Fatal("a stale stream completion lifted the block")
+		}
+		record(manager, claudeHeadersContext(t, allowed), 3)
+		if refused(manager) {
+			t.Fatal("headers that arrived after the block did not lift it")
+		}
+	})
+
+	t.Run("request dispatched first crosses the limit last", func(t *testing.T) {
+		manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+		laterCtx := claudeHeadersContext(t, allowed)                             // dispatched 2, headers first
+		stalledCtx := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil)) // dispatched 1, headers second
+		record(manager, laterCtx, 2)
+		record(manager, stalledCtx, 1)
+		if !refused(manager) {
+			t.Fatal("the crossing response was discarded because its request was dispatched first")
+		}
+	})
 }
 
 func TestClaudeExtraUsageBlockAppliesToInferenceVerification(t *testing.T) {
@@ -638,25 +650,15 @@ func TestClaudeExtraUsageCredentialFailureKeepsSnapshotOrder(t *testing.T) {
 	const model = "claude-extra-usage-isolated"
 	now := time.Now()
 	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
-	mark := func(executionSeq uint64, signals map[string]string, result Result) {
-		ctx := WithSkipPersist(t.Context())
-		if signals != nil {
-			ctx = internallogging.WithResponseHeadersHolder(ctx)
-			headers := http.Header{}
-			for key, value := range signals {
-				headers.Set(key, value)
-			}
-			internallogging.SetResponseHeaders(ctx, headers)
-		}
-		result.AuthID, result.Provider, result.ExecutionSeq = "cred-a", "claude", executionSeq
-		manager.MarkResult(ctx, result)
-	}
+	staleCtx := claudeHeadersContext(t, map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"})
+	crossingCtx := claudeHeadersContext(t, claudeExtraUsageSignals(now, nil))
 
-	mark(3, claudeExtraUsageSignals(now, nil), Result{Model: model, RouteModel: model, Success: true})
+	manager.MarkResult(crossingCtx, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true, ExecutionSeq: 3})
 	// A delayed credential-level failure without model fields rebuilds the credential quota.
-	mark(2, nil, Result{CredentialScope: true, Error: &Error{Code: "unavailable", Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable}})
+	manager.MarkResult(WithSkipPersist(t.Context()), Result{AuthID: "cred-a", Provider: "claude", CredentialScope: true, ExecutionSeq: 2,
+		Error: &Error{Code: "unavailable", Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable}})
 	// An older stream then finishes with headers from before the limit was crossed.
-	mark(1, map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed"}, Result{Model: model, RouteModel: model, Success: true})
+	manager.MarkResult(staleCtx, Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true, ExecutionSeq: 1})
 
 	auth, _ := manager.GetByID("cred-a")
 	if errRefuse := manager.claudeExtraUsageRefusal(auth, "claude-extra-usage-other-model", time.Now()); errRefuse == nil {

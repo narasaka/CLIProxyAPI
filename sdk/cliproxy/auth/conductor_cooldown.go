@@ -2240,9 +2240,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.UpdatedAt = now
 
 		if !result.SkipQuotaObservation {
-			auth.Quota.observeResultHeaders(result.Provider, responseHeaders, result.ExecutionSeq, now)
+			headersArrival := internallogging.GetResponseHeadersArrival(ctx)
+			auth.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now)
 			if modelState != nil {
-				modelState.Quota.observeResultHeaders(result.Provider, responseHeaders, result.ExecutionSeq, now)
+				modelState.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now)
 			}
 		}
 
