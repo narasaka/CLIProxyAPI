@@ -364,6 +364,10 @@ type claudeExtraUsageHomeDispatcher struct {
 	cooldownAfter string
 	cooledOnce    bool
 	metadata      map[string]map[string]any
+	// sequence, when set, dispatches these IDs in order regardless of
+	// exclusions, repeating the last one, like a legacy Home.
+	sequence []string
+	calls    int
 }
 
 func (*claudeExtraUsageHomeDispatcher) HeartbeatOK() bool { return true }
@@ -380,6 +384,17 @@ func (d *claudeExtraUsageHomeDispatcher) RPopAuthWithConstraints(_ context.Conte
 	excluded := make(map[string]struct{}, len(excludedAuthIDs))
 	for _, authID := range excludedAuthIDs {
 		excluded[authID] = struct{}{}
+	}
+	if len(d.sequence) > 0 {
+		authID := d.sequence[min(d.calls, len(d.sequence)-1)]
+		d.calls++
+		return json.Marshal(homeAuthDispatchResponse{Auth: Auth{
+			ID:       authID,
+			Provider: "claude",
+			Status:   StatusActive,
+			Metadata: d.metadata[authID],
+			Quota:    QuotaState{Signals: d.signals[authID]},
+		}})
 	}
 	if _, ok := excluded[d.cooldownAfter]; ok && !d.cooledOnce {
 		d.cooledOnce = true
@@ -804,16 +819,78 @@ func TestClaudeExtraUsageHomeRefusalDoesNotExtendRetryBudget(t *testing.T) {
 			})
 			manager.SetRetryConfig(0, 0, 0)
 			manager.RegisterExecutor(executor)
-			manager.PublishHomeDispatch(&claudeExtraUsageHomeDispatcher{
-				authIDs:  []string{"cred-a", "cred-b"},
-				signals:  map[string]map[string]string{"cred-a": claudeExtraUsageSignals(time.Now(), nil)},
-				metadata: map[string]map[string]any{"cred-a": {"request_retry": 2}, "cred-b": {"request_retry": 0}},
-			}, executionregistry.New(), 1)
+			for _, sequence := range [][]string{nil, {"cred-a", "cred-b", "cred-a", "cred-b"}} {
+				executor.mu.Lock()
+				executor.calls = nil
+				executor.mu.Unlock()
+				manager.PublishHomeDispatch(&claudeExtraUsageHomeDispatcher{
+					authIDs:  []string{"cred-a", "cred-b"},
+					signals:  map[string]map[string]string{"cred-a": claudeExtraUsageSignals(time.Now(), nil)},
+					metadata: map[string]map[string]any{"cred-a": {"request_retry": 2}, "cred-b": {"request_retry": 0}},
+					sequence: sequence,
+				}, executionregistry.New(), 1)
 
-			_, _ = invokeAfterAuthMode(manager, "claude", "claude-extra-usage-home-retry-"+mode, mode, cliproxyexecutor.Options{})
-			if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
-				t.Fatalf("executor calls = %v, want a single attempt on cred-b", calls)
+				_, _ = invokeAfterAuthMode(manager, "claude", "claude-extra-usage-home-retry-"+mode, mode, cliproxyexecutor.Options{})
+				if calls := executor.Calls(); !reflect.DeepEqual(calls, []string{"cred-b"}) {
+					t.Fatalf("dispatch sequence %v: executor calls = %v, want a single attempt on cred-b", sequence, calls)
+				}
 			}
 		})
+	}
+}
+
+func TestClaudeExtraUsageFirstStreamRecordsPerModelBlock(t *testing.T) {
+	const model = "claude-extra-usage-first-opus-stream"
+	executor := &claudeOpenStreamExecutor{
+		afterAuthTestExecutor: &afterAuthTestExecutor{id: "claude"},
+		signals: claudeExtraUsageSignals(time.Now(), map[string]string{
+			"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+			"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+		}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{Claude: internalconfig.ClaudeConfig{ExtraUsage: "block"}})
+	manager.SetRetryConfig(2, 0, 5)
+	manager.RegisterExecutor(executor)
+	for _, id := range []string{"cred-a", "cred-b"} {
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		if _, errReg := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: id, Provider: "claude", Status: StatusActive}); errReg != nil {
+			t.Fatal(errReg)
+		}
+	}
+
+	// The first request for this model on cred-a leaves its weekly window used up.
+	stream, errStream := manager.ExecuteStream(t.Context(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error = %v", errStream)
+	}
+	payload, errExec := invokeAfterAuthMode(manager, "claude", model, "execute", cliproxyexecutor.Options{})
+	close(executor.release)
+	for range stream.Chunks {
+	}
+	if errExec != nil || string(payload) != "ok:cred-b" {
+		t.Fatalf("request during the first stream: payload = %q, error = %v, want ok:cred-b", payload, errExec)
+	}
+}
+
+func TestClaudeExtraUsageStreamFromReplacedCredentialIsIgnored(t *testing.T) {
+	const model = "claude-extra-usage-replaced"
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	attempt, _ := manager.GetByID("cred-a")
+	// The credential is replaced under the same ID while the old stream is starting.
+	if _, errReg := manager.Register(WithSkipPersist(t.Context()), &Auth{ID: "cred-a", Provider: "claude", Status: StatusActive}); errReg != nil {
+		t.Fatal(errReg)
+	}
+	replacement, _ := manager.GetByID("cred-a")
+	if replacement.RegistrationEpoch <= attempt.RegistrationEpoch {
+		t.Fatalf("replacement epoch %d not newer than %d", replacement.RegistrationEpoch, attempt.RegistrationEpoch)
+	}
+	manager.observeClaudeStreamHeaders(claudeHeadersContext(t, claudeExtraUsageSignals(time.Now(), nil)), attempt, "", "claude", model)
+
+	current, _ := manager.GetByID("cred-a")
+	if errRefuse := manager.claudeExtraUsageRefusal(current, model, time.Now()); errRefuse != nil {
+		t.Fatalf("old credential's stream blocked its replacement: %v", errRefuse)
 	}
 }

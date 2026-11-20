@@ -181,19 +181,20 @@ func GetResponseHeaders(ctx context.Context) http.Header {
 	return cloneHTTPHeader(holder.headers)
 }
 
-// GetResponseHeadersArrival returns the arrival order of the headers stored in
-// ctx, or 0 when none were stored. A larger value means the headers arrived later.
-func GetResponseHeadersArrival(ctx context.Context) uint64 {
+// GetResponseHeadersWithArrival returns the headers stored in ctx together with
+// their arrival order, read under one lock so the pair is consistent. A larger
+// arrival means the headers arrived later; 0 means none were stored.
+func GetResponseHeadersWithArrival(ctx context.Context) (http.Header, uint64) {
 	if ctx == nil {
-		return 0
+		return nil, 0
 	}
 	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
 	if !ok || holder == nil {
-		return 0
+		return nil, 0
 	}
 	holder.mu.RLock()
 	defer holder.mu.RUnlock()
-	return holder.arrival
+	return cloneHTTPHeader(holder.headers), holder.arrival
 }
 
 func cloneHTTPHeader(src http.Header) http.Header {

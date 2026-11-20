@@ -1804,7 +1804,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		retryLimitBeforeAuth := homeRetryLimitValue(homeRetryLimit)
 		if homeMode {
-			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
+			m.observeHomeRetryLimit(ctx, auth, selection, homeRetryLimit)
 		}
 		if selection != nil && allowSameAuthRetry && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && auth.ID != lastHomeAuthID {
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "max_retry_credentials"); errEnd != nil {

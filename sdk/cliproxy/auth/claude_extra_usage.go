@@ -114,25 +114,31 @@ func (m *Manager) claudeExtraUsageSnapshots(auth *Auth, stateModel string) (cred
 // right away. The stream's result is recorded only when it ends, so otherwise a
 // response showing the plan limit used up would not block new requests for as
 // long as that stream runs. Arrival ordering keeps the later result from
-// replacing anything newer.
-func (m *Manager) observeClaudeStreamHeaders(ctx context.Context, authID, provider, model string) {
-	if m == nil || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+// replacing anything newer, and the same staleness check as MarkResult keeps a
+// stream from a replaced credential from writing onto its successor.
+func (m *Manager) observeClaudeStreamHeaders(ctx context.Context, attempt *Auth, accessToken, provider, model string) {
+	if m == nil || attempt == nil || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
 		return
 	}
-	headers := internallogging.GetResponseHeaders(ctx)
+	headers, arrival := internallogging.GetResponseHeadersWithArrival(ctx)
 	if len(headers) == 0 {
 		return
 	}
-	arrival := internallogging.GetResponseHeadersArrival(ctx)
 	now := time.Now()
+	attemptIdentity := Result{
+		AuthID:            attempt.ID,
+		AccessToken:       accessToken,
+		CredentialVersion: attempt.CredentialVersion,
+		RegistrationEpoch: attempt.RegistrationEpoch,
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	auth := m.auths[authID]
-	if auth == nil {
+	auth := m.auths[attempt.ID]
+	if auth == nil || isStaleExecutionResult(attemptIdentity, auth) {
 		return
 	}
 	auth.Quota.observeResultHeaders(provider, headers, arrival, now)
-	if state := existingModelState(auth, model); state != nil {
+	if state := ensureModelState(auth, model); state != nil {
 		state.Quota.observeResultHeaders(provider, headers, arrival, now)
 	}
 }
