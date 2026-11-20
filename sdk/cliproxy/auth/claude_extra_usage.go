@@ -47,6 +47,36 @@ func ApplyClaudeExtraUsageMetadata(auth *Auth) {
 	auth.Attributes[AttributeClaudeExtraUsage] = value
 }
 
+// claudeExtraUsageKeep selects whether observeResultHeaders keeps a Claude
+// extra-usage block against stale responses, and at which snapshot level.
+type claudeExtraUsageKeep int
+
+const (
+	claudeExtraUsageKeepOff claudeExtraUsageKeep = iota
+	claudeExtraUsageKeepCredential
+	claudeExtraUsageKeepModel
+)
+
+// claudeExtraUsageEnforced reports whether the extra-usage policy blocks auth:
+// a Claude subscription credential whose effective policy is block.
+func (m *Manager) claudeExtraUsageEnforced(auth *Auth) bool {
+	return auth != nil && executorKeyFromAuth(auth) == "claude" && claudeSubscriptionCredential(auth) &&
+		claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth)
+}
+
+// claudeExtraUsageKeepFor returns the keep mode for auth's snapshot at one level.
+// Without an enforced block, observations behave as for any other provider.
+func (m *Manager) claudeExtraUsageKeepFor(auth *Auth, credentialLevel bool) claudeExtraUsageKeep {
+	switch {
+	case !m.claudeExtraUsageEnforced(auth):
+		return claudeExtraUsageKeepOff
+	case credentialLevel:
+		return claudeExtraUsageKeepCredential
+	default:
+		return claudeExtraUsageKeepModel
+	}
+}
+
 // claudeSubscriptionCredential reports whether auth bills against a Claude plan,
 // the only kind of credential extra usage applies to. It matches the Claude
 // executor's classification: an OAuth token is a subscription credential even
@@ -82,7 +112,7 @@ func claudeExtraUsageBlocked(cfg *internalconfig.Config, auth *Auth) bool {
 // on the next request. Once no other credential can serve the request, the client
 // receives a 429 that carries the plan's reset time.
 func (m *Manager) claudeExtraUsageRefusal(auth *Auth, stateModel, routeModel string, now time.Time) error {
-	if auth == nil || executorKeyFromAuth(auth) != "claude" || !claudeSubscriptionCredential(auth) || !claudeExtraUsageBlocked(m.runtimeConfigSnapshot(), auth) {
+	if !m.claudeExtraUsageEnforced(auth) {
 		return nil
 	}
 	credentialSignals, modelSignals := m.claudeExtraUsageSnapshots(auth, stateModel, routeModel)
@@ -172,9 +202,9 @@ func (m *Manager) observeClaudeResponseHeaders(identity Result, provider, model,
 	if auth == nil || isStaleExecutionResult(identity, auth) {
 		return
 	}
-	auth.Quota.observeResultHeaders(provider, headers, arrival, now, true)
+	auth.Quota.observeResultHeaders(provider, headers, arrival, now, m.claudeExtraUsageKeepFor(auth, true))
 	if state := ensureModelState(auth, m.claudeObservationModelKeyLocked(auth, model, routeModel)); state != nil {
-		state.Quota.observeResultHeaders(provider, headers, arrival, now, false)
+		state.Quota.observeResultHeaders(provider, headers, arrival, now, m.claudeExtraUsageKeepFor(auth, false))
 	}
 }
 
@@ -201,14 +231,12 @@ func (m *Manager) claudeObservationModelKeyLocked(auth *Auth, model, routeModel 
 // that has rolled over to a later reset proves the block is over. The block also
 // ends on its own once its reset passes.
 func keepClaudeExtraUsageSnapshot(current map[string]string, incoming http.Header, credentialLevel bool, now time.Time) bool {
-	if _, blocked := claudeExtraUsageResetAt(current, credentialLevel, now); !blocked {
+	currentDeadline, blocked := claudeExtraUsageResetAt(current, credentialLevel, now)
+	if !blocked {
 		return false
 	}
 	incomingSignals := collectQuotaSignals("claude", incoming)
 	if len(incomingSignals) == 0 {
-		return false
-	}
-	if _, inExtraUsage := claudeExtraUsageResetAt(incomingSignals, false, now); inExtraUsage {
 		return false
 	}
 	currentHeaders := make(http.Header, len(current))
@@ -219,18 +247,43 @@ func keepClaudeExtraUsageSnapshot(current map[string]string, incoming http.Heade
 	for key, value := range incomingSignals {
 		incomingHeaders.Set(key, value)
 	}
-	for _, window := range rejectedClaudeUnifiedWindows(currentHeaders) {
+	if claudeBlockingWindowRolledOver(currentHeaders, incomingHeaders, credentialLevel) {
+		return false
+	}
+	// Judged at the same level: a per-model window in extra usage says nothing
+	// about the shared windows a credential-level block rests on. Another
+	// extra-usage response replaces the block unless it would shorten it.
+	if incomingDeadline, inExtraUsage := claudeExtraUsageResetAt(incomingSignals, credentialLevel, now); inExtraUsage {
+		return incomingDeadline.Before(currentDeadline)
+	}
+	return true
+}
+
+// claudeBlockingWindowRolledOver reports whether incoming shows a window that
+// blocks current already started over, which proves the block is over.
+func claudeBlockingWindowRolledOver(current, incoming http.Header, credentialLevel bool) bool {
+	for _, window := range rejectedClaudeUnifiedWindows(current) {
 		if credentialLevel && window != "5h" && window != "7d" {
 			continue
 		}
-		resetHeader := claudeUnifiedWindowHeader(window, "Reset")
-		currentReset, okCurrent := parseClaudeResetEpoch(currentHeaders.Get(resetHeader))
-		incomingReset, okIncoming := parseClaudeResetEpoch(incomingHeaders.Get(resetHeader))
-		if okCurrent && okIncoming && incomingReset.After(currentReset) {
-			return false
+		if claudeResetRolledOver(current, incoming, claudeUnifiedWindowHeader(window, "Reset")) {
+			return true
 		}
 	}
-	return true
+	// A block known only from the unified headers rolls over when a response for
+	// the same representative claim reports a later unified reset.
+	claim := strings.ToLower(strings.TrimSpace(current.Get("Anthropic-Ratelimit-Unified-Representative-Claim")))
+	return claim != "" && !(credentialLevel && strings.HasPrefix(claim, "seven_day_")) &&
+		strings.EqualFold(strings.TrimSpace(incoming.Get("Anthropic-Ratelimit-Unified-Representative-Claim")), claim) &&
+		claudeResetRolledOver(current, incoming, "Anthropic-Ratelimit-Unified-Reset")
+}
+
+// claudeResetRolledOver reports whether incoming carries a later value than
+// current for the given reset header, meaning that window started over.
+func claudeResetRolledOver(current, incoming http.Header, resetHeader string) bool {
+	currentReset, okCurrent := parseClaudeResetEpoch(current.Get(resetHeader))
+	incomingReset, okIncoming := parseClaudeResetEpoch(incoming.Get(resetHeader))
+	return okCurrent && okIncoming && incomingReset.After(currentReset)
 }
 
 // claudeExtraUsageResetAt reports whether signals, one upstream response's

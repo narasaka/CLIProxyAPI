@@ -1497,3 +1497,117 @@ func TestClaudeExtraUsageSameWindowAllowedResponseKeepsBlock(t *testing.T) {
 		t.Fatal("a same-window response admitted before the crossing lifted the block")
 	}
 }
+
+func TestClaudeExtraUsagePerModelResponseKeepsSharedBlock(t *testing.T) {
+	const opus, sonnet, haiku = "claude-extra-usage-keep-opus", "claude-extra-usage-keep-sonnet", "claude-extra-usage-keep-haiku"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, opus, "block", nil)
+	// A Sonnet response shows the shared 5h window used up.
+	manager.MarkResult(claudeHeadersContext(t, claudeExtraUsageSignals(now, nil)),
+		Result{AuthID: "cred-a", Provider: "claude", Model: sonnet, RouteModel: sonnet, Success: true})
+	// An Opus request admitted before that crossing returns later: 5h still allowed
+	// for it, but Opus's own weekly window is in extra usage.
+	manager.MarkResult(claudeHeadersContext(t, claudeExtraUsageSignals(now, map[string]string{
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day_opus",
+		"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+	})), Result{AuthID: "cred-a", Provider: "claude", Model: opus, RouteModel: opus, Success: true})
+
+	auth, _ := manager.GetByID("cred-a")
+	// Haiku has no snapshot of its own, so only the shared block can refuse it.
+	if manager.claudeExtraUsageRefusal(auth, haiku, haiku, time.Now()) == nil {
+		t.Fatal("a per-model extra-usage response erased the shared block")
+	}
+	if manager.claudeExtraUsageRefusal(auth, opus, opus, time.Now()) == nil {
+		t.Fatal("Opus's own weekly block was not recorded")
+	}
+}
+
+func TestClaudeExtraUsageUnifiedOnlyBlockLiftsOnLaterWindow(t *testing.T) {
+	const model = "claude-extra-usage-unified-only"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	at := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	refused := func() bool {
+		auth, _ := manager.GetByID("cred-a")
+		return manager.claudeExtraUsageRefusal(auth, model, model, time.Now()) != nil
+	}
+	record := func(signals map[string]string) {
+		manager.MarkResult(claudeHeadersContext(t, signals), Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	}
+	// The block is known only from the unified headers.
+	record(map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "rejected",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "five_hour",
+		"Anthropic-Ratelimit-Unified-Reset":                at(2 * time.Hour),
+		"Anthropic-Ratelimit-Unified-Overage-Status":       "allowed",
+	})
+	if !refused() {
+		t.Fatal("setup: unified-only extra usage not refused")
+	}
+	sameWindow := map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "allowed_warning",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "five_hour",
+		"Anthropic-Ratelimit-Unified-Reset":                at(2 * time.Hour),
+	}
+	record(sameWindow)
+	if !refused() {
+		t.Fatal("a same-window response lifted the block")
+	}
+	record(map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":               "allowed",
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "five_hour",
+		"Anthropic-Ratelimit-Unified-Reset":                at(7 * time.Hour),
+	})
+	if refused() {
+		t.Fatal("a response from the next window did not lift the block")
+	}
+}
+
+func TestClaudeExtraUsageKeepRuleOnlyAppliesWhenBlocking(t *testing.T) {
+	const model = "claude-extra-usage-keep-allow"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "allow", nil)
+	record := func(signals map[string]string) {
+		manager.MarkResult(claudeHeadersContext(t, signals), Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	}
+	record(claudeExtraUsageSignals(now, nil))
+	// A later real 429 with overage rejected must show up in the quota view.
+	record(map[string]string{
+		"Anthropic-Ratelimit-Unified-Status":         "rejected",
+		"Anthropic-Ratelimit-Unified-5h-Status":      "rejected",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10),
+		"Anthropic-Ratelimit-Unified-Overage-Status": "rejected",
+	})
+	auth, _ := manager.GetByID("cred-a")
+	if got := auth.Quota.Signals["Anthropic-Ratelimit-Unified-Overage-Status"]; got != "rejected" {
+		t.Fatalf("allow-mode snapshot overage status = %q, want the latest response's rejected", got)
+	}
+}
+
+func TestClaudeExtraUsageShorterStaleBlockDoesNotShortenLongerOne(t *testing.T) {
+	const model = "claude-extra-usage-keep-longer"
+	now := time.Now()
+	manager, _, _ := newClaudeExtraUsageTestManager(t, model, "block", nil)
+	at := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	record := func(signals map[string]string) {
+		manager.MarkResult(claudeHeadersContext(t, signals), Result{AuthID: "cred-a", Provider: "claude", Model: model, RouteModel: model, Success: true})
+	}
+	// The 7d window is used up for five days.
+	record(claudeExtraUsageSignals(now, map[string]string{
+		"Anthropic-Ratelimit-Unified-Representative-Claim": "seven_day",
+		"Anthropic-Ratelimit-Unified-Reset":                at(120 * time.Hour),
+		"Anthropic-Ratelimit-Unified-5h-Status":            "allowed",
+		"Anthropic-Ratelimit-Unified-7d-Status":            "rejected",
+		"Anthropic-Ratelimit-Unified-7d-Reset":             at(120 * time.Hour),
+	}))
+	// A response admitted after the 5h crossing but before the 7d one arrives late.
+	record(claudeExtraUsageSignals(now, map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Status": "allowed",
+		"Anthropic-Ratelimit-Unified-7d-Reset":  at(120 * time.Hour),
+	}))
+	auth, _ := manager.GetByID("cred-a")
+	var refusal *credentialTerminatedError
+	if !errors.As(manager.claudeExtraUsageRefusal(auth, model, model, now), &refusal) || refusal.recoverAt.Sub(now) < 119*time.Hour {
+		t.Fatalf("refusal = %+v, want the five-day block kept", refusal)
+	}
+}

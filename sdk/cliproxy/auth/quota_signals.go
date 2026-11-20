@@ -62,14 +62,15 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 // Other providers keep the latest recorded result, as do results whose headers
 // carry no arrival order.
 //
-// credentialLevel marks the credential-wide snapshot, as opposed to a model's.
-func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time, credentialLevel bool) {
+// keep selects whether, and for which snapshot level, a Claude extra-usage block
+// is kept against stale responses; it is off unless the policy is block.
+func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time, keep claudeExtraUsageKeep) {
 	claude := strings.EqualFold(strings.TrimSpace(provider), "claude")
 	ordered := arrival > 0 && claude
 	if q == nil || (ordered && arrival < q.observedSeq) {
 		return
 	}
-	if claude && keepClaudeExtraUsageSnapshot(q.Signals, headers, credentialLevel, observedAt) {
+	if claude && keep != claudeExtraUsageKeepOff && keepClaudeExtraUsageSnapshot(q.Signals, headers, keep == claudeExtraUsageKeepCredential, observedAt) {
 		return
 	}
 	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && ordered {
