@@ -97,6 +97,32 @@ func TestParseConfigBytesClaudeSessionDatePinDays(t *testing.T) {
 	}
 }
 
+func TestParseConfigBytesClaudeExtraUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{name: "defaults to allow", yaml: "port: 8317\n", want: ""},
+		{name: "legacy layout", yaml: "claude:\n  extra-usage: block\n", want: ClaudeExtraUsageBlock},
+		{name: "v8 layout", yaml: "config-version: 8\nupstream:\n  claude:\n    extra-usage: block\n", want: ClaudeExtraUsageBlock},
+		{name: "case and spacing", yaml: "claude:\n  extra-usage: ' Allow '\n", want: ClaudeExtraUsageAllow},
+		{name: "unknown value falls back to allow", yaml: "claude:\n  extra-usage: blok\n", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, errParse := ParseConfigBytes([]byte(tt.yaml))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if got := cfg.Claude.ExtraUsage; got != tt.want {
+				t.Fatalf("cfg.Claude.ExtraUsage = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSaveConfigPreserveComments_SessionDatePinDaysExplicitZeroWhenAbsent(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if errWrite := os.WriteFile(configPath, []byte("port: 8317\n"), 0o600); errWrite != nil {

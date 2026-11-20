@@ -128,6 +128,12 @@ type ClaudeConfig struct {
 	// specify fallbacks. Default false leaves cross-model fallbacks omitted unless
 	// explicitly configured by the caller or payload rules.
 	ServerSideFallback bool `yaml:"server-side-fallback" json:"server-side-fallback"`
+	// ExtraUsage controls subscription credentials whose plan limit is used up
+	// while Anthropic would bill further requests as extra usage. "allow" (the
+	// default) keeps sending them; "block" skips that credential until the limit
+	// resets and answers 429 when no other credential can serve the request. An
+	// "extra_usage" field in a credential's auth file overrides this value.
+	ExtraUsage string `yaml:"extra-usage,omitempty" json:"extra-usage,omitempty"`
 	// SessionDatePinDays retains the cloaked currentDate pin per session for
 	// this many days in in-memory mode (server.kv-store.disabled: true without
 	// Home), independently of continuity expiry and credential switches. A nil
@@ -146,6 +152,23 @@ type ClaudeConfig struct {
 // requests should include the org:create_api_key scope.
 func (c *ClaudeConfig) OAuthIncludeCreateAPIKeyEnabled() bool {
 	return c == nil || c.OAuthIncludeCreateAPIKey == nil || *c.OAuthIncludeCreateAPIKey
+}
+
+// Claude extra-usage policy values.
+const (
+	ClaudeExtraUsageAllow = "allow"
+	ClaudeExtraUsageBlock = "block"
+)
+
+// NormalizeClaudeExtraUsage returns the canonical policy value, or "" when raw is
+// empty or not a known policy.
+func NormalizeClaudeExtraUsage(raw string) string {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case ClaudeExtraUsageAllow, ClaudeExtraUsageBlock:
+		return value
+	default:
+		return ""
+	}
 }
 
 // DefaultClaudeSessionDatePinDays is the session date pin retention applied

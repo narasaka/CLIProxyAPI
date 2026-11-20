@@ -188,6 +188,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Claude.ServerSideFallback != newCfg.Claude.ServerSideFallback {
 		changes = append(changes, fmt.Sprintf("claude.server-side-fallback: %t -> %t", oldCfg.Claude.ServerSideFallback, newCfg.Claude.ServerSideFallback))
 	}
+	if oldCfg.Claude.ExtraUsage != newCfg.Claude.ExtraUsage {
+		changes = append(changes, fmt.Sprintf("claude.extra-usage: %q -> %q", oldCfg.Claude.ExtraUsage, newCfg.Claude.ExtraUsage))
+	}
 	if oldCfg.XAI.InjectXSearch != newCfg.XAI.InjectXSearch {
 		changes = append(changes, fmt.Sprintf("xai.inject-x-search: %t -> %t", oldCfg.XAI.InjectXSearch, newCfg.XAI.InjectXSearch))
 	}

@@ -809,8 +809,11 @@ type requestToFormatResolver interface {
 	RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
 }
 
+// credentialTerminatedError refuses one credential for the current request
+// without changing its availability. terminal is the client-facing error used
+// when no other credential serves the request.
 type credentialTerminatedError struct {
-	terminal *cliproxyexecutor.RequestTerminatedError
+	terminal error
 }
 
 func (e *credentialTerminatedError) Error() string {
@@ -818,6 +821,15 @@ func (e *credentialTerminatedError) Error() string {
 		return "credential terminated by plugin"
 	}
 	return e.terminal.Error()
+}
+
+// applyRequestAfterAuth runs the built-in per-credential request checks, then the
+// plugin after-auth interceptor. Both refuse a credential the same way.
+func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, time.Now()); errRefuse != nil {
+		return req, opts, errRefuse
+	}
+	return applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
 }
 
 func isCredentialTerminatedError(err error) bool {
@@ -1250,7 +1262,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
-			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
 				if isCredentialTerminatedError(errIntercept) {
 					recordRequestRefusedAuth(ctx, auth.ID)
