@@ -554,6 +554,27 @@ upstream:
     # for Responses).
     server-side-fallback: false
 
+    # What to do when a Claude subscription credential (for example a Team seat with
+    # extra usage enabled) has used up its 5h/7d plan limit and Anthropic would bill
+    # further requests as extra usage.
+    #   allow (default): keep sending requests; Anthropic bills them as extra usage.
+    #   block: skip that credential until its plan limit resets. When no other
+    #          credential can serve the request, clients get a 429 with Retry-After,
+    #          like a plan without extra usage.
+    # The block is decided per request from the credential's latest rate-limit
+    # headers, so the request that first goes over the limit, and any requests
+    # already sent when its response arrives, are still billed. Blocks are kept in
+    # memory, so after a restart each blocked seat may bill one more request before
+    # its next response re-establishes the block. A block lasts until the reset
+    # Anthropic reported or a response from a later plan window; if limits come back
+    # sooner, restart or stay on allow until then. Refused seats count toward
+    # max-retry-credentials. Switching back to allow takes effect on the next
+    # request. Hot-reloadable.
+    # Override per credential with "extra_usage": "allow" or "block" in its auth file.
+    # Real API keys are billed at API rates anyway and are never affected; an OAuth
+    # token (sk-ant-oat...) configured under claude-api-key counts as a subscription.
+    extra-usage: allow
+
     # Days to retain the cloaked currentDate pin per session in in-memory mode
     # (server.kv-store.disabled: true without Home), so an idle gap or a credential
     # switch cannot re-anchor the date and invalidate earlier thinking signatures and the

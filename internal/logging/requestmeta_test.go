@@ -32,3 +32,22 @@ func TestWithFreshResponseHeadersHolderIsolatesAttempts(t *testing.T) {
 		t.Fatalf("second attempt holder = %q, want second", got)
 	}
 }
+
+func TestObserveResponseHeadersSeesEveryUpdateInArrivalOrder(t *testing.T) {
+	ctx := WithFreshResponseHeadersHolder(context.Background())
+	var seen []uint64
+	ObserveResponseHeaders(ctx, func(headers http.Header, arrival uint64) {
+		// The holder is unlocked while the observer runs.
+		current, currentArrival := GetResponseHeadersWithArrival(ctx)
+		if currentArrival != arrival || current.Get("X-Step") != headers.Get("X-Step") {
+			t.Errorf("observer saw %q@%d, holder has %q@%d", headers.Get("X-Step"), arrival, current.Get("X-Step"), currentArrival)
+		}
+		seen = append(seen, arrival)
+	})
+
+	SetResponseHeaders(ctx, http.Header{"X-Step": {"set"}})
+	MergeResponseHeaders(ctx, http.Header{"X-Step": {"merge"}})
+	if len(seen) != 2 || seen[0] == 0 || seen[1] <= seen[0] {
+		t.Fatalf("observed arrivals = %v, want two increasing values", seen)
+	}
+}

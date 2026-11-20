@@ -944,7 +944,7 @@ func clearDisabledCooldownStateForAuth(auth *Auth, now time.Time) bool {
 			if shadow := state.credentialQuotaShadow; shadow != nil {
 				if keptShadow, _ := clampStateToForceDeadline(shadow, now); keptShadow {
 					preservedSeq := shadow.cooldownRecordedSeq
-					*state = *shadow.cloneShallow()
+					replaceModelStateKeepingObservation(state, *shadow.cloneShallow())
 					state.cooldownRecordedSeq = preservedSeq
 					state.credentialQuotaPropagated = false
 					state.credentialQuotaShadow = nil
@@ -1600,7 +1600,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 		now = time.Now()
-		responseHeaders := internallogging.GetResponseHeaders(ctx)
+		responseHeaders, headersArrival := internallogging.GetResponseHeadersWithArrival(ctx)
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
@@ -1690,7 +1690,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						!(auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now)) {
 						if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
 							preservedSeq := shadow.cooldownRecordedSeq
-							*state = *shadow.cloneShallow()
+							replaceModelStateKeepingObservation(state, *shadow.cloneShallow())
 							state.cooldownRecordedSeq = preservedSeq
 						} else {
 							resetModelState(state, now)
@@ -1710,11 +1710,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if ownLayerPending {
 						if state.credentialQuotaShadow != nil {
 							preservedSeq := state.credentialQuotaShadow.cooldownRecordedSeq
-							*state = *state.credentialQuotaShadow.cloneShallow()
+							replaceModelStateKeepingObservation(state, *state.credentialQuotaShadow.cloneShallow())
 							state.cooldownRecordedSeq = preservedSeq
 						} else {
-							fresh := &ModelState{}
-							*state = *fresh
+							replaceModelStateKeepingObservation(state, ModelState{})
 						}
 					}
 					seedInitialForceCooldownDeadlines(auth)
@@ -1995,7 +1994,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						if result.CredentialScope && auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.credQuotaForceUntil.After(now) && auth.Quota.NextRecoverAt.After(now) {
 							lastErr := cloneError(state.LastError)
 							statusMsg := state.StatusMessage
-							*state = *savedOuterState
+							replaceModelStateKeepingObservation(state, *savedOuterState)
 							state.LastError = lastErr
 							state.StatusMessage = statusMsg
 							state.Unavailable = true
@@ -2133,8 +2132,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 						auth.NextRetryAfter = authOwnRetry
 						auth.Quota = QuotaState{
-							ObservedAt: savedModelAggQuota.ObservedAt,
-							Signals:    maps.Clone(savedModelAggQuota.Signals),
+							ObservedAt:  savedModelAggQuota.ObservedAt,
+							Signals:     maps.Clone(savedModelAggQuota.Signals),
+							observedSeq: savedModelAggQuota.observedSeq,
 						}
 					}
 					prevAuthQuotaActive := auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now)
@@ -2239,9 +2239,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.UpdatedAt = now
 
 		if !result.SkipQuotaObservation {
-			auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+			auth.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now, m.claudeExtraUsageKeepFor(auth, true))
 			if modelState != nil {
-				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+				modelState.Quota.observeResultHeaders(result.Provider, responseHeaders, headersArrival, now, m.claudeExtraUsageKeepFor(auth, false))
 			}
 		}
 
@@ -2868,7 +2868,7 @@ func propagateCredentialQuotaToModelStatesLocked(auth *Auth, exclude *ModelState
 			!prevAuthCredActive {
 			if shadow := otherState.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
 				preservedSeq := shadow.cooldownRecordedSeq
-				*otherState = *shadow.cloneShallow()
+				replaceModelStateKeepingObservation(otherState, *shadow.cloneShallow())
 				otherState.cooldownRecordedSeq = preservedSeq
 			} else {
 				resetModelState(otherState, now)
@@ -2932,7 +2932,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 		if state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota" {
 			if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
 				preservedSeq := shadow.cooldownRecordedSeq
-				*state = *shadow.cloneShallow()
+				replaceModelStateKeepingObservation(state, *shadow.cloneShallow())
 				state.cooldownRecordedSeq = preservedSeq
 			} else {
 				resetModelState(state, now)

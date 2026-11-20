@@ -54,6 +54,41 @@ func (q *QuotaState) ObserveResponseHeadersForProvider(provider string, headers 
 	return true
 }
 
+// observeResultHeaders replaces the passive snapshot with a result's response
+// headers unless headers that arrived later already replaced it. A Claude stream
+// records its result only when it ends, with the headers it received at its start,
+// and a request can reach the upstream after one dispatched later, so neither
+// recording nor dispatch order says which headers are newest; arrival order does.
+// Other providers keep the latest recorded result, as do results whose headers
+// carry no arrival order.
+//
+// keep selects whether, and for which snapshot level, a Claude extra-usage block
+// is kept against stale responses; it is off unless the policy is block.
+func (q *QuotaState) observeResultHeaders(provider string, headers http.Header, arrival uint64, observedAt time.Time, keep claudeExtraUsageKeep) {
+	claude := strings.EqualFold(strings.TrimSpace(provider), "claude")
+	ordered := arrival > 0 && claude
+	if q == nil {
+		return
+	}
+	keeping := claude && keep != claudeExtraUsageKeepOff
+	credentialLevel := keep == claudeExtraUsageKeepCredential
+	if ordered && arrival < q.observedSeq {
+		// Observers can commit out of arrival order. An earlier-arriving response
+		// that shows extra usage still wins over a newer snapshot the keep rule
+		// would have discarded against it: one from the same plan window.
+		if keeping {
+			q.adoptOlderClaudeExtraUsage(headers, credentialLevel, observedAt)
+		}
+		return
+	}
+	if keeping && keepClaudeExtraUsageSnapshot(q.Signals, headers, credentialLevel, observedAt) {
+		return
+	}
+	if q.ObserveResponseHeadersForProvider(provider, headers, observedAt) && ordered {
+		q.observedSeq = arrival
+	}
+}
+
 // ClearObservationSignals removes only passive observation data. It leaves
 // cooldown and scheduler state untouched.
 func (q *QuotaState) ClearObservationSignals() bool {
@@ -245,10 +280,88 @@ func isQuotaSignalHeaderForProvider(provider, name string) bool {
 // unioning signals captured at different times, so merging an older snapshot
 // can never resurrect a stale watermark.
 func mergeQuotaObservation(target, source QuotaState) QuotaState {
-	if source.ObservedAt.IsZero() || source.ObservedAt.Before(target.ObservedAt) {
+	if source.ObservedAt.IsZero() {
+		return target
+	}
+	// Header arrival orders Claude snapshots when both carry it; recording time
+	// can lag behind it.
+	if source.observedSeq > 0 && target.observedSeq > 0 && source.observedSeq != target.observedSeq {
+		if source.observedSeq < target.observedSeq {
+			return target
+		}
+	} else if source.ObservedAt.Before(target.ObservedAt) {
 		return target
 	}
 	target.ObservedAt = source.ObservedAt
 	target.Signals = source.Clone().Signals
+	target.observedSeq = source.observedSeq
 	return target
+}
+
+// replaceModelStateKeepingObservation replaces state with a restored or fresh
+// cooldown state but keeps the newer of the two passive quota observations: a
+// cooldown transition must never roll the upstream watermark back.
+func replaceModelStateKeepingObservation(state *ModelState, replacement ModelState) {
+	if state == nil {
+		return
+	}
+	observation := state.Quota
+	*state = replacement
+	state.Quota = mergeQuotaObservation(state.Quota, observation)
+}
+
+// preserveModelObservations keeps each model's newer passive quota observation
+// when a credential is updated with the same credentials, whatever model states
+// the update brings. Only observation data moves; cooldown state is untouched.
+func preserveModelObservations(auth, existing *Auth) {
+	if auth == nil || existing == nil {
+		return
+	}
+	cloned := false
+	for model, previous := range existing.ModelStates {
+		if previous == nil || previous.Quota.ObservedAt.IsZero() {
+			continue
+		}
+		state := auth.ModelStates[model]
+		if state == previous {
+			continue
+		}
+		if !cloned {
+			auth.ModelStates = cloneModelStates(auth.ModelStates)
+			if auth.ModelStates == nil {
+				auth.ModelStates = make(map[string]*ModelState)
+			}
+			cloned = true
+			state = auth.ModelStates[model]
+		}
+		if state == nil {
+			state = &ModelState{Status: StatusActive}
+			auth.ModelStates[model] = state
+		}
+		observation := mergeQuotaObservation(state.Quota, previous.Quota)
+		state.Quota.ObservedAt = observation.ObservedAt
+		state.Quota.Signals = observation.Signals
+		state.Quota.observedSeq = observation.observedSeq
+	}
+}
+
+// adoptOlderClaudeExtraUsage takes the signals of headers that arrived before the
+// current snapshot when they show extra usage that the current snapshot only
+// hides, keeping the newer arrival stamp so later responses still order against it.
+func (q *QuotaState) adoptOlderClaudeExtraUsage(headers http.Header, credentialLevel bool, observedAt time.Time) {
+	older := collectQuotaSignals("claude", headers)
+	current := make(http.Header, len(q.Signals))
+	for key, value := range q.Signals {
+		current.Set(key, value)
+	}
+	if !keepClaudeExtraUsageSnapshot(older, current, credentialLevel, observedAt) {
+		return
+	}
+	q.Signals = older
+	// The adoption keeps the newer arrival stamp, so it must be the later
+	// observation for copies that hold that stamp to defer to it.
+	if !observedAt.After(q.ObservedAt) {
+		observedAt = q.ObservedAt.Add(time.Nanosecond)
+	}
+	q.ObservedAt = observedAt
 }

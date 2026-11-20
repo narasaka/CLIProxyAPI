@@ -1664,6 +1664,7 @@ func (m *Manager) closestCooldownWaitWithAttemptedForRequest(ctx context.Context
 		providerSet[key] = struct{}{}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	refused := requestRefusedAuthsFromContext(ctx)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var (
@@ -1672,6 +1673,10 @@ func (m *Manager) closestCooldownWaitWithAttemptedForRequest(ctx context.Context
 	)
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		// A credential refused for this request cannot serve a later round either.
+		if _, isRefused := refused[auth.ID]; isRefused {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
@@ -1770,10 +1775,15 @@ func (m *Manager) retryAllowedForRequest(ctx context.Context, attempt int, provi
 	}
 
 	registryRef := registry.GetGlobalRegistry()
+	refused := requestRefusedAuthsFromContext(ctx)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		// A credential refused for this request cannot serve a later round either.
+		if _, isRefused := refused[auth.ID]; isRefused {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
@@ -1916,7 +1926,27 @@ func (m *Manager) homeRetryAllowed(attempt int, retryLimit int) bool {
 	return attempt < retryLimit
 }
 
-func (m *Manager) observeHomeRetryLimit(auth *Auth, selection *HomeDispatchSelection, retryLimit *int) {
+func homeRetryLimitValue(retryLimit *int) int {
+	if retryLimit == nil {
+		return -1
+	}
+	return *retryLimit
+}
+
+// restoreHomeRetryLimitAfterRefusal undoes a refused credential's own retry
+// override: it never served the request, so it must not extend the retry budget.
+// A request_retry sent by Home stays authoritative.
+func restoreHomeRetryLimitAfterRefusal(retryLimit *int, before int, selection *HomeDispatchSelection) {
+	if retryLimit == nil || (selection != nil && selection.hasRequestRetry) {
+		return
+	}
+	*retryLimit = before
+}
+
+// observeHomeRetryLimit applies a Home selection's retry budget. A credential
+// already refused for this request (tracked in ctx) cannot serve it, so its own
+// request_retry must not extend the budget, even when Home dispatches it again.
+func (m *Manager) observeHomeRetryLimit(ctx context.Context, auth *Auth, selection *HomeDispatchSelection, retryLimit *int) {
 	if m == nil || retryLimit == nil {
 		return
 	}
@@ -1925,6 +1955,9 @@ func (m *Manager) observeHomeRetryLimit(auth *Auth, selection *HomeDispatchSelec
 		return
 	}
 	if auth == nil {
+		return
+	}
+	if _, refused := requestRefusedAuthsFromContext(ctx)[auth.ID]; refused {
 		return
 	}
 	limit := int(m.requestRetry.Load())

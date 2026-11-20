@@ -45,6 +45,11 @@ func (cfg *Config) NormalizeClaudeConfig() {
 		days := DefaultClaudeSessionDatePinDays
 		cfg.Claude.SessionDatePinDays = &days
 	}
+	extraUsage := NormalizeClaudeExtraUsage(cfg.Claude.ExtraUsage)
+	if extraUsage == "" && strings.TrimSpace(cfg.Claude.ExtraUsage) != "" {
+		log.Warnf("unrecognized claude extra-usage %q (supported: allow, block); falling back to allow", cfg.Claude.ExtraUsage)
+	}
+	cfg.Claude.ExtraUsage = extraUsage
 }
 
 // SanitizeCodexHeaderDefaults trims surrounding whitespace from the

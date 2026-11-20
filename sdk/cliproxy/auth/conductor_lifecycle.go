@@ -488,6 +488,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
 	} else {
 		auth.CredentialVersion = existingVersion
+		// A passive quota observation describes the credential, not this update
+		// (a config reload rebuilds config credentials without one), so keep the
+		// newer snapshot while the credentials stay the same.
+		observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+		auth.Quota.ObservedAt = observation.ObservedAt
+		auth.Quota.Signals = observation.Signals
+		auth.Quota.observedSeq = observation.observedSeq
 	}
 	cooldownStateChanged := false
 	now := time.Now()
@@ -518,6 +525,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Quota = existing.Quota.Clone()
 			auth.Quota.ObservedAt = observation.ObservedAt
 			auth.Quota.Signals = observation.Signals
+			auth.Quota.observedSeq = observation.observedSeq
 			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 			auth.forceCooldownUntil = existing.forceCooldownUntil
 			auth.quotaForceCooldownUntil = existing.quotaForceCooldownUntil
@@ -614,6 +622,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Quota = existing.Quota
 			auth.Quota.ObservedAt = observation.ObservedAt
 			auth.Quota.Signals = observation.Signals
+			auth.Quota.observedSeq = observation.observedSeq
 			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 			auth.forceCooldownUntil = existing.forceCooldownUntil
 			auth.quotaForceCooldownUntil = existing.quotaForceCooldownUntil
@@ -661,6 +670,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 				}
 			}
 		}
+	}
+	if !credChanged {
+		preserveModelObservations(auth, existing)
 	}
 	auth.UpdatedAt = now
 	cooldownStateChanged = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false) || cooldownStateChanged

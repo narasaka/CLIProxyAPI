@@ -531,7 +531,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		var errIntercept error
-		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		execReq, execOpts, errIntercept = m.applyRequestAfterAuth(ctx, executor, auth, provider, resultModel, routeModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		if errIntercept != nil {
 			if isCredentialTerminatedError(errIntercept) {
 				if auth != nil {
@@ -557,6 +557,24 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		executionSeq := m.nextExecutionSeq()
 		accessToken := authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 		startStream := time.Now()
+		upstreamBeforeAttempt := upstreamErr
+		// refuseAfterRefresh honors a block recorded while the token was refreshed:
+		// the refreshed resend would be a new billed request.
+		refuseAfterRefresh := func() error {
+			errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, routeModel, time.Now())
+			if errRefuse == nil {
+				return nil
+			}
+			upstreamErr = upstreamBeforeAttempt
+			recordRequestRefusedAuth(ctx, auth.ID)
+			if upstreamErr != nil {
+				return preferredExecutionAttemptError(lastErr, upstreamErr)
+			}
+			return errRefuse
+		}
+		if !ephemeralResult {
+			m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel, routeModel)
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -575,11 +593,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					auth = refreshed
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					if errRefuse := refuseAfterRefresh(); errRefuse != nil {
+						return nil, errRefuse
+					}
 					ctx = m.newUpstreamAttemptContext(ctx)
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					accessToken = authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 					startRetry := time.Now()
+					if !ephemeralResult {
+						m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel, routeModel)
+					}
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 					if hasUpstreamExecutionAttempt(errStream) {
@@ -661,11 +685,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					auth = refreshed
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					if errRefuse := refuseAfterRefresh(); errRefuse != nil {
+						return nil, errRefuse
+					}
 					ctx = m.newUpstreamAttemptContext(ctx)
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					accessToken = authAccessTokenForRequest(ctx, auth, execOpts.Headers)
 					startRetry := time.Now()
+					if !ephemeralResult {
+						m.watchClaudeResponseHeaders(ctx, auth, accessToken, provider, resultModel, routeModel)
+					}
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)

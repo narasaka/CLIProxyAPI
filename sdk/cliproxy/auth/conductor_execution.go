@@ -214,6 +214,10 @@ func unwrapExecutionBoundaryError(err error) error {
 }
 
 func roundPickFailureError(lastErr, upstreamErr, errPick error) error {
+	var cooldown *modelCooldownError
+	if upstreamErr == nil && errors.As(errPick, &cooldown) && cooldown != nil && refusalOutlastsWait(lastErr, cooldown.resetIn, time.Now()) {
+		return errPick
+	}
 	preferred := preferredExecutionAttemptError(lastErr, upstreamErr)
 	if isSchedulerRejectError(errPick) {
 		return markRoundEndedBySchedulerReject(preferred)
@@ -351,7 +355,11 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		if isCredentialTerminatedError(errExec) {
 			if preferredUpstreamErr == nil {
-				return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
+				errRefused := unwrapExecutionBoundaryError(errExec)
+				if pinnedThread {
+					errRefused = claudeThreadReplayError(errRefused)
+				}
+				return cliproxyexecutor.Response{}, errRefused
 			}
 			break
 		}
@@ -656,7 +664,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		if isCredentialTerminatedError(errStream) {
 			if preferredUpstreamErr == nil {
-				return nil, unwrapExecutionBoundaryError(errStream)
+				errRefused := unwrapExecutionBoundaryError(errStream)
+				if pinnedThread {
+					errRefused = claudeThreadReplayError(errRefused)
+				}
+				return nil, errRefused
 			}
 			break
 		}
@@ -809,8 +821,13 @@ type requestToFormatResolver interface {
 	RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
 }
 
+// credentialTerminatedError refuses one credential for the current request
+// without changing its availability. terminal is the client-facing error used
+// when no other credential serves the request. recoverAt is set when the refusal
+// knows when the credential becomes usable again.
 type credentialTerminatedError struct {
-	terminal *cliproxyexecutor.RequestTerminatedError
+	terminal  error
+	recoverAt time.Time
 }
 
 func (e *credentialTerminatedError) Error() string {
@@ -818,6 +835,53 @@ func (e *credentialTerminatedError) Error() string {
 		return "credential terminated by plugin"
 	}
 	return e.terminal.Error()
+}
+
+// applyRequestAfterAuth runs the built-in per-credential request checks around
+// the plugin after-auth interceptor. Both refuse a credential the same way. The
+// extra-usage check runs again after the interceptor, which may wait while
+// another response records a block. Token counting is not billed, so it skips
+// the extra-usage check.
+func (m *Manager) applyRequestAfterAuth(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, stateModel, routeModel string, countTokens bool, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	if !countTokens {
+		if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
+			return req, opts, errRefuse
+		}
+	}
+	req, opts, errIntercept := applyRequestAfterAuthInterceptor(ctx, executor, provider, req, opts, requestedModel)
+	if errIntercept != nil || countTokens || opts.RequestAfterAuthInterceptor == nil {
+		return req, opts, errIntercept
+	}
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
+		return req, opts, errRefuse
+	}
+	return req, opts, nil
+}
+
+// refusalOutlastsWait reports whether lastErr is a refusal whose credential
+// recovers later than the remaining candidates' cooldown wait. Returning that
+// cooldown instead lets the normal retry wait serve the request rather than
+// reporting the refused credential's much later recovery.
+func refusalOutlastsWait(lastErr error, wait time.Duration, now time.Time) bool {
+	var refusal *credentialTerminatedError
+	if !errors.As(lastErr, &refusal) || refusal == nil || refusal.recoverAt.IsZero() {
+		return false
+	}
+	return now.Add(wait).Before(refusal.recoverAt)
+}
+
+// keepEarlierCredentialRefusal returns next unless both errors are refusals with a
+// known recovery time and current recovers first, so a request refused by every
+// credential reports the earliest time any of them can serve again.
+func keepEarlierCredentialRefusal(current, next error) error {
+	var currentRefusal, nextRefusal *credentialTerminatedError
+	if errors.As(current, &currentRefusal) && errors.As(next, &nextRefusal) &&
+		currentRefusal != nil && nextRefusal != nil &&
+		!currentRefusal.recoverAt.IsZero() && !nextRefusal.recoverAt.IsZero() &&
+		currentRefusal.recoverAt.Before(nextRefusal.recoverAt) {
+		return current
+	}
+	return next
 }
 
 func isCredentialTerminatedError(err error) bool {
@@ -1250,7 +1314,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			var errIntercept error
-			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, executor, auth, provider, resultModel, routeModel, false, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
 				if isCredentialTerminatedError(errIntercept) {
 					recordRequestRefusedAuth(ctx, auth.ID)
@@ -1263,6 +1327,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = withUpstreamAttemptProvider(syncMetadataSessionToContext(execCtx, execOpts.Metadata), provider)
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
+			upstreamBeforeAttempt := upstreamErr
+			m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel, routeModel)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -1281,8 +1347,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					didRefreshOnUnauthorized = true
 					execCtx = withUpstreamAttemptProvider(m.newUpstreamAttemptContext(execCtx), provider)
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
+					// The refreshed token resolves the 401, but resending is a new billed
+					// request, so it honors a block recorded in the meantime.
+					if errRefuse := m.claudeExtraUsageRefusal(auth, resultModel, routeModel, time.Now()); errRefuse != nil {
+						upstreamErr = upstreamBeforeAttempt
+						recordRequestRefusedAuth(ctx, auth.ID)
+						authErr = errRefuse
+						break
+					}
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					m.watchClaudeResponseHeaders(execCtx, auth, authAccessTokenForRequest(execCtx, auth, execOpts.Headers), provider, resultModel, routeModel)
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
@@ -1347,7 +1422,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
-				lastErr = authErr
+				lastErr = keepEarlierCredentialRefusal(lastErr, authErr)
 				if homeMode {
 					homeAuthCount++
 				}
@@ -1615,7 +1690,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		if authErr != nil {
 			if isCredentialTerminatedError(authErr) {
-				lastErr = authErr
+				lastErr = keepEarlierCredentialRefusal(lastErr, authErr)
 				if homeMode {
 					homeAuthCount++
 				}
@@ -1719,6 +1794,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			var homeCooldown *homeDispatchRetryAfterError
 			if homeMode && lastErr != nil && errors.As(errPick, &homeCooldown) && homeCooldown != nil {
 				observeHomeCooldownRetryLimit(homeCooldown, homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == "")
+				if upstreamErr == nil && homeCooldown.retryAfter > 0 && refusalOutlastsWait(preferredErr, homeCooldown.retryAfter, time.Now()) {
+					return nil, markHomeRetryRoundExhausted(errPick, homeCooldown.RetryAfter(), false)
+				}
 				if isCredentialTerminatedError(preferredErr) {
 					return nil, preferredErr
 				}
@@ -1744,8 +1822,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		retryLimitBeforeAuth := homeRetryLimitValue(homeRetryLimit)
 		if homeMode {
-			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
+			m.observeHomeRetryLimit(ctx, auth, selection, homeRetryLimit)
 		}
 		if selection != nil && allowSameAuthRetry && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && auth.ID != lastHomeAuthID {
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "max_retry_credentials"); errEnd != nil {
@@ -1994,6 +2073,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			if isCredentialTerminatedError(errStream) {
 				recordRequestRefusedAuth(ctx, auth.ID)
+				if homeMode {
+					restoreHomeRetryLimitAfterRefusal(homeRetryLimit, retryLimitBeforeAuth, selection)
+				}
 				if selection != nil {
 					homeExcludedAuthIDs[auth.ID] = struct{}{}
 					lastHomeAuthID = auth.ID
@@ -2003,7 +2085,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 						return nil, errEnd
 					}
 				}
-				lastErr = errStream
+				lastErr = keepEarlierCredentialRefusal(lastErr, errStream)
 				if homeMode {
 					homeAuthCount++
 				}
@@ -3341,6 +3423,10 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	if stateModel == "" {
 		stateModel = canonicalModelKey(routeModel)
 	}
+	// Verification is a real, billed request, so it honors claude.extra-usage too.
+	if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
+		return auth, unwrapExecutionBoundaryError(errRefuse)
+	}
 
 	sessionID := fmt.Sprintf("verify-%s-%d", auth.ID, time.Now().UTC().UnixNano())
 	// Codex upstreams reject integer max_output_tokens below 16, so the minimal
@@ -3366,10 +3452,15 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	credVersion := auth.CredentialVersion
 	regEpoch := auth.RegistrationEpoch
 
+	m.watchClaudeResponseHeaders(execCtx, auth, accessToken, provider, stateModel, routeModel)
 	streamRes, errStream := executor.ExecuteStream(execCtx, auth, req, opts)
 	if errStream != nil {
 		rerr := resultErrorFromError(errStream)
 		if rerr != nil && rerr.HTTPStatus == http.StatusNotImplemented {
+			// The fallback is another billed request; honor a block recorded meanwhile.
+			if errRefuse := m.claudeExtraUsageRefusal(auth, stateModel, routeModel, time.Now()); errRefuse != nil {
+				return auth, unwrapExecutionBoundaryError(errRefuse)
+			}
 			opts.Stream = false
 			resp, errExec := executor.Execute(execCtx, auth, req, opts)
 			rerrExec := resultErrorFromError(errExec)

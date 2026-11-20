@@ -190,6 +190,9 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			var homeCooldown *homeDispatchRetryAfterError
 			if lastErr != nil && errors.As(errSelection, &homeCooldown) && homeCooldown != nil {
 				observeHomeCooldownRetryLimit(homeCooldown, homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == "")
+				if upstreamErr == nil && homeCooldown.retryAfter > 0 && refusalOutlastsWait(preferredErr, homeCooldown.retryAfter, time.Now()) {
+					return cliproxyexecutor.Response{}, markHomeRetryRoundExhausted(errSelection, homeCooldown.RetryAfter(), false)
+				}
 				if isCredentialTerminatedError(preferredErr) {
 					return cliproxyexecutor.Response{}, preferredErr
 				}
@@ -211,7 +214,8 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			selection.End("missing_execution_target")
 			return cliproxyexecutor.Response{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
-		m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
+		retryLimitBeforeAuth := homeRetryLimitValue(homeRetryLimit)
+		m.observeHomeRetryLimit(ctx, auth, selection, homeRetryLimit)
 		if _, seen := tried[auth.ID]; seen {
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "repeated_auth"); errEnd != nil {
 				return cliproxyexecutor.Response{}, errEnd
@@ -347,7 +351,7 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 				execOpts.Metadata = ensureCanonicalSessionMetadata(execOpts.Metadata, execOpts.Headers, payload)
 			}
 			var errIntercept error
-			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, selection.Executor, selection.Provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			execReq, execOpts, errIntercept = m.applyRequestAfterAuth(execCtx, selection.Executor, preparedAuth, selection.Provider, resultModel, routeModel, countTokens, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
 				if isCredentialTerminatedError(errIntercept) {
 					refusedErr = errIntercept
@@ -469,7 +473,8 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		}
 		if refusedErr != nil {
 			recordRequestRefusedAuth(ctx, auth.ID)
-			lastErr = refusedErr
+			restoreHomeRetryLimitAfterRefusal(homeRetryLimit, retryLimitBeforeAuth, selection)
+			lastErr = keepEarlierCredentialRefusal(lastErr, refusedErr)
 			releaseAttempt()
 			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "credential_refused"); errEnd != nil {
 				return cliproxyexecutor.Response{}, errEnd

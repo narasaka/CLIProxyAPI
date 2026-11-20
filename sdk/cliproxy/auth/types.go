@@ -366,6 +366,9 @@ type QuotaState struct {
 	// cooldown was recorded so out-of-order completions cannot overwrite them.
 	cooldownSignals   map[string]string
 	cooldownEvaluated bool
+	// observedSeq is the arrival order of the response headers behind Signals, so
+	// headers that arrived earlier but were recorded later cannot replace them.
+	observedSeq uint64
 }
 
 // Clone returns an independent copy of the quota state.
